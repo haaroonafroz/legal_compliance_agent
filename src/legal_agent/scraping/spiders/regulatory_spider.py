@@ -61,18 +61,21 @@ class RegulatorySpider(scrapy.Spider):
             return
 
         title = response.css("title::text").get(default="").strip()
-        body_text = trafilatura.extract(
+        extracted = trafilatura.extract(
             response.text,
             output_format="markdown",
             include_links=True,
             include_tables=True,
             favor_recall=True,
         )
-
-        if body_text:
+        if not title:
+            meta = trafilatura.extract_metadata(response.text)
+            if meta and meta.title:
+                title = meta.title
+        if extracted:
             yield RegulatoryDocumentItem(
-                title=title or trafilatura.extract_metadata(response.text).title or "",
-                full_text=body_text,
+                title=title,
+                full_text=extracted,
                 jurisdiction=jurisdiction,
                 effective_date="",
                 source_url=response.url,
