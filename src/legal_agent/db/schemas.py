@@ -22,20 +22,25 @@ REGULATORY_PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
     "is_processed": PayloadSchemaType.BOOL,
     "jurisdiction": PayloadSchemaType.KEYWORD,
     "source_url": PayloadSchemaType.KEYWORD,
+    "topic_tags": PayloadSchemaType.KEYWORD,
+    "compliance_domain": PayloadSchemaType.KEYWORD,
+    "applies_to_departments": PayloadSchemaType.KEYWORD,
+    "obligation_type": PayloadSchemaType.KEYWORD,
 }
 
 POLICIES_PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
     "department": PayloadSchemaType.KEYWORD,
     "policy_id": PayloadSchemaType.KEYWORD,
+    "topic_tags": PayloadSchemaType.KEYWORD,
+    "compliance_domain": PayloadSchemaType.KEYWORD,
+    "obligation_type": PayloadSchemaType.KEYWORD,
 }
 
 
 def ensure_collections(client: "QdrantClient", settings: "Settings") -> None:
     """Create Qdrant collections if they don't already exist, then add payload indexes."""
-    vector_params = VectorParams(
-        size=settings.openai_embedding_dim,
-        distance=Distance.COSINE,
-    )
+    dim = settings.legal_embedding_dim if settings.use_legal_embeddings else settings.openai_embedding_dim
+    vector_params = VectorParams(size=dim, distance=Distance.COSINE)
 
     _ensure_one(
         client,
