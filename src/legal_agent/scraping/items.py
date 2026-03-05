@@ -16,7 +16,6 @@ class RegulatoryDocumentItem(scrapy.Item):
 
 
 class ChunkedRegulationItem(scrapy.Item):
-    """Produced after chunking – one item per chunk."""
     text = scrapy.Field()
     header_path = scrapy.Field()
     source_url = scrapy.Field()
@@ -24,3 +23,8 @@ class ChunkedRegulationItem(scrapy.Item):
     effective_date = scrapy.Field()
     is_processed = scrapy.Field()
     chunk_index = scrapy.Field()
+    # AI-enriched metadata
+    topic_tags = scrapy.Field()
+    compliance_domain = scrapy.Field()
+    applies_to_departments = scrapy.Field()
+    obligation_type = scrapy.Field()

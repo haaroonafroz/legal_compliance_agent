@@ -15,6 +15,10 @@ class NewLawEvent(Event):
     source_url: str
     effective_date: str
     chunk_ids: list[int] = Field(default_factory=list)
+    topic_tags: list[str] = Field(default_factory=list)
+    compliance_domain: str = ""
+    applies_to_departments: list[str] = Field(default_factory=list)
+    obligation_type: str = ""
 
 
 class RetrievedContextEvent(Event):

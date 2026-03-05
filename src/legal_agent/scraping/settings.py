@@ -17,6 +17,7 @@ DEFAULT_REQUEST_HEADERS = {
 ITEM_PIPELINES = {
     "legal_agent.scraping.pipelines.DoclingPdfPipeline": 100,
     "legal_agent.scraping.pipelines.ChunkingPipeline": 200,
+    "legal_agent.scraping.pipelines.MetadataEnrichmentPipeline": 250,
     "legal_agent.scraping.pipelines.QdrantPipeline": 300,
 }
 

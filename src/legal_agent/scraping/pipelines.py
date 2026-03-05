@@ -8,8 +8,17 @@ import re
 import tempfile
 from pathlib import Path
 from typing import Any
-
+import json
+import torch
+from openai import OpenAI
+from legal_agent.config import get_settings
+from legal_agent.workflow.prompts import _ENRICHMENT_FEW_SHOT
 from legal_agent.scraping.items import ChunkedRegulationItem, RegulatoryDocumentItem
+from qdrant_client.models import PointStruct
+from legal_agent.utils.models import embed_texts
+from docling.document_converter import DocumentConverter
+from legal_agent.config import get_settings
+from legal_agent.db.client import client_from_settings
 
 logger = logging.getLogger(__name__)
 
@@ -27,11 +36,9 @@ class DoclingPdfPipeline:
             return item
 
         try:
-            from docling.document_converter import DocumentConverter
-
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-                tmp.write(item["raw_pdf_bytes"])
-                tmp_path = Path(tmp.name)
+            tmp.write(item["raw_pdf_bytes"])
+            tmp_path = Path(tmp.name)
 
             converter = DocumentConverter()
             result = converter.convert(str(tmp_path))
@@ -129,7 +136,75 @@ class ChunkingPipeline:
 
 
 # ---------------------------------------------------------------------------
-# Pipeline 3 – Upsert into Qdrant
+# Pipeline 3 – Metadata enrichment
+# ---------------------------------------------------------------------------
+class MetadataEnrichmentPipeline:
+    """Use a legal SLM or OpenAI to extract normalized metadata from each chunk."""
+    def __init__(self):
+        self._tokenizer = None
+        self._model = None
+        self._settings = None
+    def open_spider(self, spider):
+        self._settings = get_settings()
+        self._client = client_from_settings(self._settings)
+        self._collection = self._settings.qdrant_regulatory_collection
+            )
+    def process_item(self, item, spider):
+        if isinstance(item, list):
+            return [self._enrich(chunk) for chunk in item]
+        if isinstance(item, ChunkedRegulationItem):
+            return self._enrich(item)
+        return item
+    def _enrich(self, chunk):
+        text = chunk["text"][:2000]
+        defaults = {
+            "topic_tags": [],
+            "compliance_domain": "",
+            "applies_to_departments": [],
+            "obligation_type": "",
+        }
+        try:
+            if self._settings.use_legal_slm:
+                meta = self._extract_with_slm(text)
+            else:
+                meta = self._extract_with_openai(text)
+            for key in defaults:
+                chunk[key] = meta.get(key, defaults[key])
+        except Exception:
+            logger.warning("Metadata enrichment failed, using defaults.", exc_info=True)
+            for key, val in defaults.items():
+                chunk[key] = val
+        return chunk
+    def _extract_with_slm(self, text: str) -> dict:
+        prompt = _ENRICHMENT_FEW_SHOT.format(text=text)
+        inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
+        with torch.no_grad():
+            outputs = self._model.generate(
+                **inputs,
+                max_new_tokens=256,
+                temperature=0.1,
+                do_sample=True,
+                pad_token_id=self._tokenizer.eos_token_id,
+                stop_strings=["###", "### Example"],
+            )
+        generated = self._tokenizer.decode(
+            outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
+        )
+        return json.loads(generated.strip())
+    def _extract_with_openai(self, text: str) -> dict:
+        client = OpenAI(api_key=self._settings.openai_api_key)
+        resp = client.chat.completions.create(
+            model=self._settings.openai_llm_model,
+            messages=[
+                {"role": "system", "content": "You are a legal metadata tagger. Output JSON only."},
+                {"role": "user", "content": _ENRICHMENT_FEW_SHOT.format(text=text)},
+            ],
+            response_format={"type": "json_object"},
+            temperature=0,
+        )
+        return json.loads(resp.choices[0].message.content)
+# ---------------------------------------------------------------------------
+# Pipeline 4 – Upsert into Qdrant
 # ---------------------------------------------------------------------------
 class QdrantPipeline:
     """Embed chunks and upsert them into the regulatory_updates Qdrant collection."""
@@ -140,14 +215,9 @@ class QdrantPipeline:
         self._collection: str = ""
 
     def open_spider(self, spider: Any) -> None:
-        from legal_agent.config import get_settings
-        from legal_agent.db.client import client_from_settings
-
         settings = get_settings()
         self._client = client_from_settings(settings)
         self._collection = settings.qdrant_regulatory_collection
-
-        from openai import OpenAI
 
         self._openai = OpenAI(api_key=settings.openai_api_key)
         self._embed_model = settings.openai_embedding_model
@@ -161,17 +231,16 @@ class QdrantPipeline:
         return item
 
     def _upsert_chunk(self, chunk: ChunkedRegulationItem) -> None:
-        from qdrant_client.models import PointStruct
-
         text = chunk["text"]
-        resp = self._openai.embeddings.create(input=[text], model=self._embed_model)
-        vector = resp.data[0].embedding
-
+        domain = chunk.get("compliance_domain", "")
+        tags = chunk.get("topic_tags", [])
+        embed_input = f"[{domain}] [{', '.join(tags)}] {text}"
+        vectors = embed_texts([embed_input], self._settings)
+        vector = vectors[0]
         point_id = hashlib.sha256(
             f"{chunk['source_url']}:{chunk['chunk_index']}".encode()
         ).hexdigest()[:32]
         point_id_int = int(point_id, 16) % (2**63)
-
         self._client.upsert(
             collection_name=self._collection,
             points=[
@@ -186,6 +255,10 @@ class QdrantPipeline:
                         "effective_date": chunk["effective_date"],
                         "is_processed": False,
                         "chunk_index": chunk["chunk_index"],
+                        "topic_tags": chunk.get("topic_tags", []),
+                        "compliance_domain": chunk.get("compliance_domain", ""),
+                        "applies_to_departments": chunk.get("applies_to_departments", []),
+                        "obligation_type": chunk.get("obligation_type", ""),
                     },
                 )
             ],
