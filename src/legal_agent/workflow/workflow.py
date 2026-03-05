@@ -111,16 +111,22 @@ class ComplianceWorkflow(Workflow):
     # ------------------------------------------------------------------
     @step
     async def librarian(self, ctx: Context, ev: NewLawEvent) -> RetrievedContextEvent:
-        """Retrieve internal policies relevant to the new regulation."""
+        """Retrieve internal policies using hybrid search (dense + sparse)."""
         logger.info("Librarian: searching internal policies for '%s'…", ev.source_url)
-        from legal_agent.utils.models import embed_texts
-        from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+        from legal_agent.utils.models import embed_texts, sparse_encode_texts
+        from qdrant_client.models import (
+            FieldCondition, Filter, FusionQuery, MatchAny, MatchValue,
+            Prefetch, SparseVector,
+        )
 
         domain = ev.compliance_domain
         tags = ev.topic_tags
         embed_input = f"[{domain}] [{', '.join(tags)}] {ev.regulation_text[:8000]}"
-        vectors = embed_texts([embed_input], self.settings)
-        query_vector = vectors[0]
+
+        # Compute both vector types
+        dense_vector = embed_texts([embed_input], self.settings)[0]
+        indices, values = sparse_encode_texts([embed_input], self.settings)[0]
+
         # Build optional metadata filter
         filter_conditions = []
         if tags:
@@ -132,10 +138,25 @@ class ComplianceWorkflow(Workflow):
                 FieldCondition(key="compliance_domain", match=MatchValue(value=domain))
             )
         query_filter = Filter(should=filter_conditions) if filter_conditions else None
+
+        # Hybrid search: prefetch from both dense and sparse, then fuse with RRF
         hits = self.qdrant.query_points(
             collection_name=self.settings.qdrant_policies_collection,
-            query=query_vector,
-            query_filter=query_filter,
+            prefetch=[
+                Prefetch(
+                    query=dense_vector,
+                    using=self.settings.qdrant_policies_dense_name,  # "internal_policy"
+                    limit=20,
+                    filter=query_filter,
+                ),
+                Prefetch(
+                    query=SparseVector(indices=indices, values=values),
+                    using=self.settings.qdrant_sparse_name,           # "legal_clause"
+                    limit=20,
+                    filter=query_filter,
+                ),
+            ],
+            query=FusionQuery(fusion="rrf"),
             limit=10,
             with_payload=True,
         )
