@@ -1,0 +1,48 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "legal-agent"
+version = "0.1.0"
+description = "Automated regulatory change detection, compliance gap analysis, and policy update drafting"
+requires-python = ">=3.11"
+dependencies = [
+    "llama-index>=0.12.0",
+    "llama-index-llms-openai>=0.3.0",
+    "llama-index-embeddings-openai>=0.3.0",
+    "qdrant-client>=1.12.0",
+    "scrapy>=2.12.0",
+    "docling>=2.15.0",
+    "langfuse>=2.57.0",
+    "arize-phoenix>=8.0.0",
+    "openinference-instrumentation-llama-index>=3.0.0",
+    "langwatch>=0.2.0",
+    "openai>=1.60.0",
+    "python-dotenv>=1.0.0",
+    "click>=8.1.0",
+    "pydantic>=2.10.0",
+    "pydantic-settings>=2.7.0",
+    "trafilatura>=2.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+    "pytest-asyncio>=0.25.0",
+    "ruff>=0.9.0",
+]
+
+[project.scripts]
+legal-agent = "legal_agent.cli:cli"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/legal_agent"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]

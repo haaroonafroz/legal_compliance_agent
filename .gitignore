@@ -1,0 +1,13 @@
+Project_map.md
+.env
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+dist/
+build/
+.scrapy/
+data/reports/
+*.pdf
+.ruff_cache/
+.pytest_cache/
