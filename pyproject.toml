@@ -12,6 +12,7 @@ dependencies = [
     "llama-index-llms-openai>=0.3.0",
     "llama-index-embeddings-openai>=0.3.0",
     "qdrant-client>=1.12.0",
+    "fastembed>=0.5.0",
     "scrapy>=2.12.0",
     "docling>=2.15.0",
     "langfuse>=2.57.0",
@@ -24,6 +25,10 @@ dependencies = [
     "pydantic>=2.10.0",
     "pydantic-settings>=2.7.0",
     "trafilatura>=2.0.0",
+    "transformers>=4.47.0",
+    "torch>=2.5.0",
+    "sentence-transformers>=3.3.0",
+    "accelerate>=1.2.0",
 ]
 
 [project.optional-dependencies]
