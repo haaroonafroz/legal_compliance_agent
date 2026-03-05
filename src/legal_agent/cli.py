@@ -104,44 +104,45 @@ def run_workflow() -> None:
 @cli.command()
 @click.argument("json_file", type=click.Path(exists=True))
 def load_policies(json_file: str) -> None:
-    """Bulk-load internal policies into Qdrant from a JSON file.
-
-    Expected format: list of {"policy_id", "department", "last_updated", "text"}.
-    """
     settings = get_settings()
     from legal_agent.db.client import client_from_settings
+    from legal_agent.utils.models import compute_vectors
 
     client = client_from_settings(settings)
-    from openai import OpenAI
-
-    oai = OpenAI(api_key=settings.openai_api_key)
-
     policies = json.loads(open(json_file, encoding="utf-8").read())
     from qdrant_client.models import PointStruct
 
     points = []
     for idx, policy in enumerate(policies):
-        resp = oai.embeddings.create(
-            input=[policy["text"][:8000]], model=settings.openai_embedding_model
-        )
-        vector = resp.data[0].embedding
+        text = policy["text"][:8000]
+        domain = policy.get("compliance_domain", "")
+        tags = policy.get("topic_tags", [])
+        embed_input = f"[{domain}] [{', '.join(tags)}] {text}"
+
+        named_vectors = compute_vectors(
+            [embed_input],
+            settings,
+            dense_name=settings.qdrant_policies_dense_name,  # "internal_policy"
+            sparse_name=settings.qdrant_sparse_name,          # "legal_clause"
+        )[0]
+
         points.append(
             PointStruct(
                 id=idx,
-                vector=vector,
+                vector=named_vectors,
                 payload={
                     "text": policy["text"],
                     "policy_id": policy.get("policy_id", f"POL-{idx:04d}"),
                     "department": policy.get("department", "General"),
                     "last_updated": policy.get("last_updated", ""),
+                    "topic_tags": tags,
+                    "compliance_domain": domain,
+                    "obligation_type": policy.get("obligation_type", ""),
                 },
             )
         )
 
-    client.upsert(
-        collection_name=settings.qdrant_policies_collection,
-        points=points,
-    )
+    client.upsert(collection_name=settings.qdrant_policies_collection, points=points)
     click.echo(f"Loaded {len(points)} policies into '{settings.qdrant_policies_collection}'.")
 
 

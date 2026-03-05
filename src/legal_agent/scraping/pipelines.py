@@ -15,7 +15,7 @@ from legal_agent.config import get_settings
 from legal_agent.workflow.prompts import _ENRICHMENT_FEW_SHOT
 from legal_agent.scraping.items import ChunkedRegulationItem, RegulatoryDocumentItem
 from qdrant_client.models import PointStruct
-from legal_agent.utils.models import embed_texts
+from legal_agent.utils.models import embed_texts, compute_vectors
 from docling.document_converter import DocumentConverter
 from legal_agent.config import get_settings
 from legal_agent.db.client import client_from_settings
@@ -146,8 +146,11 @@ class MetadataEnrichmentPipeline:
         self._settings = None
     def open_spider(self, spider):
         self._settings = get_settings()
-        self._client = client_from_settings(self._settings)
-        self._collection = self._settings.qdrant_regulatory_collection
+        if self._settings.use_legal_slm:
+            self._tokenizer, self._model = get_legal_slm(
+                self._settings.legal_slm_model,
+                self._settings.legal_slm_device,
+                self._settings.legal_slm_load_in_4bit,
             )
     def process_item(self, item, spider):
         if isinstance(item, list):
@@ -215,12 +218,9 @@ class QdrantPipeline:
         self._collection: str = ""
 
     def open_spider(self, spider: Any) -> None:
-        settings = get_settings()
-        self._client = client_from_settings(settings)
-        self._collection = settings.qdrant_regulatory_collection
-
-        self._openai = OpenAI(api_key=settings.openai_api_key)
-        self._embed_model = settings.openai_embedding_model
+        self._settings = get_settings()
+        self._client = client_from_settings(self._settings)
+        self._collection = self._settings.qdrant_regulatory_collection
 
     def process_item(self, item: Any, spider: Any) -> Any:
         if isinstance(item, list):
@@ -235,18 +235,24 @@ class QdrantPipeline:
         domain = chunk.get("compliance_domain", "")
         tags = chunk.get("topic_tags", [])
         embed_input = f"[{domain}] [{', '.join(tags)}] {text}"
-        vectors = embed_texts([embed_input], self._settings)
-        vector = vectors[0]
+        
+        named_vectors = compute_vectors(
+            [embed_input],
+            self._settings,
+            dense_name=self._settings.qdrant_regulatory_dense_name,  # "compliance"
+            sparse_name=self._settings.qdrant_sparse_name,            # "legal_clause"
+        )[0]
         point_id = hashlib.sha256(
             f"{chunk['source_url']}:{chunk['chunk_index']}".encode()
         ).hexdigest()[:32]
         point_id_int = int(point_id, 16) % (2**63)
+
         self._client.upsert(
             collection_name=self._collection,
             points=[
                 PointStruct(
                     id=point_id_int,
-                    vector=vector,
+                    vector=named_vectors,
                     payload={
                         "text": text,
                         "header_path": chunk["header_path"],

@@ -18,6 +18,12 @@ class Settings(BaseSettings):
     qdrant_api_key: str = os.getenv("QDRANT_API_KEY")
     qdrant_regulatory_collection: str = "regulatory_updates"
     qdrant_policies_collection: str = "internal_policies"
+    # Named vector field names (must match Qdrant collection definition)
+    qdrant_regulatory_dense_name: str = "compliance"
+    qdrant_policies_dense_name: str = "internal_policy"
+    qdrant_sparse_name: str = "legal_clause"
+    # FastEmbed
+    sparse_embedding_model: str = "Qdrant/bm42-all-minilm-l6-v2-attentions"
 
 
     # Local legal models

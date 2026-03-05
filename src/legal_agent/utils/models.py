@@ -70,3 +70,38 @@ def embed_texts(texts: list[str], settings: "Settings") -> list[list[float]]:
     if settings.use_legal_embeddings:
         return embed_texts_legal(texts, settings)
     return embed_texts_openai(texts, settings)
+
+@lru_cache(maxsize=1)
+def get_sparse_encoder(model_name: str):
+    """Load the sparse BM25/SPLADE encoder once and cache it."""
+    from fastembed import SparseTextEmbedding
+    logger.info("Loading sparse embedding model: %s", model_name)
+    return SparseTextEmbedding(model_name=model_name)
+def sparse_encode_texts(texts: list[str], settings: "Settings") -> list[tuple[list[int], list[float]]]:
+    """Return sparse vectors as (indices, values) tuples."""
+    encoder = get_sparse_encoder(settings.sparse_embedding_model)
+    results = list(encoder.embed(texts))
+    return [(r.indices.tolist(), r.values.tolist()) for r in results]
+def compute_vectors(
+    texts: list[str],
+    settings: "Settings",
+    dense_name: str,
+    sparse_name: str,
+) -> list[dict]:
+    """Compute both dense and sparse vectors, returning the named-vector dict for each text.
+    Returns a list of dicts like:
+    {
+        "compliance": [0.12, -0.34, ...],           # dense
+        "legal_clause": SparseVector(indices, values) # sparse
+    }
+    """
+    from qdrant_client.models import SparseVector
+    dense_vectors = embed_texts(texts, settings)
+    sparse_pairs = sparse_encode_texts(texts, settings)
+    result = []
+    for dense, (indices, values) in zip(dense_vectors, sparse_pairs):
+        result.append({
+            dense_name: dense,
+            sparse_name: SparseVector(indices=indices, values=values),
+        })
+    return result
