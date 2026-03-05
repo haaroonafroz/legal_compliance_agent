@@ -98,6 +98,10 @@ class ComplianceWorkflow(Workflow):
                 source_url=source_url,
                 effective_date=first.get("effective_date", ""),
                 chunk_ids=[c.id for c in chunks],
+                topic_tags=first.get("topic_tags", []),
+                compliance_domain=first.get("compliance_domain", ""),
+                applies_to_departments=first.get("applies_to_departments", []),
+                obligation_type=first.get("obligation_type", ""),
             )
 
         return StopEvent(result={"reports": []})
@@ -109,15 +113,29 @@ class ComplianceWorkflow(Workflow):
     async def librarian(self, ctx: Context, ev: NewLawEvent) -> RetrievedContextEvent:
         """Retrieve internal policies relevant to the new regulation."""
         logger.info("Librarian: searching internal policies for '%s'…", ev.source_url)
+        from legal_agent.utils.models import embed_texts
+        from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
 
-        resp = self._openai.embeddings.create(
-            input=[ev.regulation_text[:8000]], model=self._embed_model
-        )
-        query_vector = resp.data[0].embedding
-
+        domain = ev.compliance_domain
+        tags = ev.topic_tags
+        embed_input = f"[{domain}] [{', '.join(tags)}] {ev.regulation_text[:8000]}"
+        vectors = embed_texts([embed_input], self.settings)
+        query_vector = vectors[0]
+        # Build optional metadata filter
+        filter_conditions = []
+        if tags:
+            filter_conditions.append(
+                FieldCondition(key="topic_tags", match=MatchAny(any=tags))
+            )
+        if domain:
+            filter_conditions.append(
+                FieldCondition(key="compliance_domain", match=MatchValue(value=domain))
+            )
+        query_filter = Filter(should=filter_conditions) if filter_conditions else None
         hits = self.qdrant.query_points(
             collection_name=self.settings.qdrant_policies_collection,
             query=query_vector,
+            query_filter=query_filter,
             limit=10,
             with_payload=True,
         )
