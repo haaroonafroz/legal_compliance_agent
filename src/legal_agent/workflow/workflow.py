@@ -13,6 +13,7 @@ from llama_index.core.workflow import (
     step,
 )
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
+from llama_index.core.base.llms.types import ChatMessage, MessageRole
 
 from legal_agent.config import Settings
 from legal_agent.db.client import client_from_settings
@@ -37,6 +38,13 @@ logger = logging.getLogger(__name__)
 
 MAX_AUDIT_RETRIES = 2
 
+def _chat_messages(system: str, user: str) -> list[ChatMessage]:
+    """Build a [system, user] ChatMessage list for ``llm.achat()``."""
+    return [
+        ChatMessage(role=MessageRole.SYSTEM, content=system),
+        ChatMessage(role=MessageRole.USER, content=user),
+    ]
+
 
 class ComplianceWorkflow(Workflow):
     """End-to-end compliance gap analysis: scan → retrieve → analyse → draft → audit."""
@@ -50,7 +58,9 @@ class ComplianceWorkflow(Workflow):
         from openai import OpenAI
 
         self._openai = OpenAI(api_key=settings.openai_api_key)
-        self._embed_model = settings.openai_embedding_model
+        # #embedding model with dimensions
+        # self._embed_model_name = settings.openai_embedding_model
+        # self._embed_dimensions = settings.openai_embedding_dim
 
     # ------------------------------------------------------------------
     # Step 1 – Horizon Scanner
@@ -82,9 +92,9 @@ class ComplianceWorkflow(Workflow):
             grouped.setdefault(key, []).append(pt)
 
         reports = []
-        await ctx.set("reports", reports)
-        await ctx.set("grouped_keys", list(grouped.keys()))
-        await ctx.set("pending_count", len(grouped))
+        await ctx.store.set("reports", reports)
+        await ctx.store.set("grouped_keys", list(grouped.keys()))
+        await ctx.store.set("pending_count", len(grouped))
 
         for source_url, chunks in grouped.items():
             chunks.sort(key=lambda p: p.payload.get("chunk_index", 0))
@@ -195,15 +205,16 @@ class ComplianceWorkflow(Workflow):
             policies_text=policies_text[:6000],
         )
 
-        response = await self.llm.acomplete(
-            prompt,
-            system_prompt=ANALYST_SYSTEM,
-        )
+        # response = await self.llm.acomplete(
+        #     prompt,
+        #     system_prompt=ANALYST_SYSTEM,
+        # )
+        response = await self.llm.achat(messages=_chat_messages(ANALYST_SYSTEM, prompt))
 
         return AnalysisCompleteEvent(
             regulation=ev.regulation,
             matched_policies=ev.matched_policies,
-            gap_analysis=response.text,
+            gap_analysis=response.message.content,
         )
 
     # ------------------------------------------------------------------
@@ -215,12 +226,13 @@ class ComplianceWorkflow(Workflow):
         logger.info("Redliner: drafting amendments for '%s'…", ev.regulation.source_url)
 
         prompt = REDLINER_USER.format(gap_analysis=ev.gap_analysis[:8000])
-        response = await self.llm.acomplete(prompt, system_prompt=REDLINER_SYSTEM)
+        # response = await self.llm.acomplete(prompt, system_prompt=REDLINER_SYSTEM)
+        response = await self.llm.achat(messages=_chat_messages(REDLINER_SYSTEM, prompt))
 
         return DraftCompleteEvent(
             regulation=ev.regulation,
             gap_analysis=ev.gap_analysis,
-            proposed_updates=response.text,
+            proposed_updates=response.message.content,
         )
 
     # ------------------------------------------------------------------
@@ -229,10 +241,10 @@ class ComplianceWorkflow(Workflow):
     @step
     async def auditor(
         self, ctx: Context, ev: DraftCompleteEvent | AuditResultEvent
-    ) -> FinalReportEvent | AnalysisCompleteEvent:
+    ) -> FinalReportEvent | AnalysisCompleteEvent | AuditResultEvent:
         """Review outputs for hallucinations. Retry via Analyst if audit fails."""
         if isinstance(ev, AuditResultEvent):
-            retries = await ctx.get("audit_retries", default=0)
+            retries = await ctx.store.get("audit_retries", default=0)
             if ev.passed or retries >= MAX_AUDIT_RETRIES:
                 return FinalReportEvent(
                     jurisdiction=ev.regulation.jurisdiction,
@@ -243,7 +255,7 @@ class ComplianceWorkflow(Workflow):
                     passed=ev.passed,
                 )
             logger.warning("Audit FAILED (retry %d) – sending back to Analyst.", retries + 1)
-            await ctx.set("audit_retries", retries + 1)
+            await ctx.store.set("audit_retries", retries + 1)
             return AnalysisCompleteEvent(
                 regulation=ev.regulation,
                 matched_policies=[],
@@ -255,36 +267,39 @@ class ComplianceWorkflow(Workflow):
             gap_analysis=ev.gap_analysis[:6000],
             proposed_updates=ev.proposed_updates[:6000],
         )
-        response = await self.llm.acomplete(prompt, system_prompt=AUDITOR_SYSTEM)
+        # response = await self.llm.acomplete(prompt, system_prompt=AUDITOR_SYSTEM)
+        response = await self.llm.achat(messages=_chat_messages(AUDITOR_SYSTEM, prompt))
 
-        passed = response.text.strip().upper().startswith("PASS")
+        passed = response.message.content.strip().upper().startswith("PASS")
 
         audit_ev = AuditResultEvent(
             regulation=ev.regulation,
             gap_analysis=ev.gap_analysis,
             proposed_updates=ev.proposed_updates,
-            audit_notes=response.text,
+            audit_notes=response.message.content,
             passed=passed,
         )
+        return audit_ev
 
-        retries = await ctx.get("audit_retries", default=0)
-        if passed or retries >= MAX_AUDIT_RETRIES:
-            return FinalReportEvent(
-                jurisdiction=ev.regulation.jurisdiction,
-                source_url=ev.regulation.source_url,
-                gap_analysis=ev.gap_analysis,
-                proposed_updates=ev.proposed_updates,
-                audit_notes=response.text,
-                passed=passed,
-            )
+        # retries = await ctx.get("audit_retries", default=0)
+        # if passed or retries >= MAX_AUDIT_RETRIES:
+        #     return FinalReportEvent(
+        #         jurisdiction=ev.regulation.jurisdiction,
+        #         source_url=ev.regulation.source_url,
+        #         gap_analysis=ev.gap_analysis,
+        #         proposed_updates=ev.proposed_updates,
+        #         audit_notes=response.text,
+        #         passed=passed,
+        #     )
 
-        logger.warning("Audit FAILED – sending back to Analyst for re-analysis.")
-        await ctx.set("audit_retries", retries + 1)
-        return AnalysisCompleteEvent(
-            regulation=ev.regulation,
-            matched_policies=[],
-            gap_analysis=ev.gap_analysis,
-        )
+        # logger.warning("Audit FAILED – sending back to Analyst for re-analysis.")
+        # # await ctx.set("audit_retries", retries + 1)
+        # await ctx.data["audit_retries"] = retries + 1
+        # return AnalysisCompleteEvent(
+        #     regulation=ev.regulation,
+        #     matched_policies=[],
+        #     gap_analysis=ev.gap_analysis,
+        # )
 
     # ------------------------------------------------------------------
     # Collect final reports
