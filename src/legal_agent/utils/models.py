@@ -61,7 +61,7 @@ def embed_texts_openai(texts: list[str], settings: "Settings") -> list[list[floa
     from openai import OpenAI
 
     client = OpenAI(api_key=settings.openai_api_key)
-    resp = client.embeddings.create(input=texts, model=settings.openai_embedding_model)
+    resp = client.embeddings.create(input=texts, model=settings.openai_embedding_model, dimensions=settings.openai_embedding_dim)
     return [d.embedding for d in resp.data]
 
 

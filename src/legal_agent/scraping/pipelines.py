@@ -37,8 +37,8 @@ class DoclingPdfPipeline:
 
         try:
             with tempfile.NamedTemporaryFile(suffix=".pdf", delete=False) as tmp:
-            tmp.write(item["raw_pdf_bytes"])
-            tmp_path = Path(tmp.name)
+                tmp.write(item["raw_pdf_bytes"])
+                tmp_path = Path(tmp.name)
 
             converter = DocumentConverter()
             result = converter.convert(str(tmp_path))
@@ -179,7 +179,7 @@ class MetadataEnrichmentPipeline:
                 chunk[key] = val
         return chunk
     def _extract_with_slm(self, text: str) -> dict:
-        prompt = _ENRICHMENT_FEW_SHOT.format(text=text)
+        prompt = _ENRICHMENT_FEW_SHOT.replace("{text}", text)
         inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
         with torch.no_grad():
             outputs = self._model.generate(
@@ -200,7 +200,7 @@ class MetadataEnrichmentPipeline:
             model=self._settings.openai_llm_model,
             messages=[
                 {"role": "system", "content": "You are a legal metadata tagger. Output JSON only."},
-                {"role": "user", "content": _ENRICHMENT_FEW_SHOT.format(text=text)},
+                {"role": "user", "content": _ENRICHMENT_FEW_SHOT.replace("{text}", text)},
             ],
             response_format={"type": "json_object"},
             temperature=0,
