@@ -35,11 +35,29 @@ def init_db() -> None:
 
 
 @cli.command()
-@click.option("--sources", default=None, help="Path to targets.json (overrides config).")
-def scrape(sources: str | None) -> None:
-    """Run the regulatory harvesting spider."""
-    from scrapy.crawler import CrawlerProcess
+@click.option(
+    "--sources",
+    default=None,
+    help="Path to targets.json (overrides the value from config/env).",
+    show_default=True,
+)
+@click.option(
+    "--log-level",
+    default="ERROR",
+    type=click.Choice(["DEBUG", "INFO", "WARNING", "ERROR"], case_sensitive=False),
+    help="Scrapy log level.",
+    show_default=True,
+)
+def scrape(sources: str | None, log_level: str) -> None:
+    """Run the regulatory harvesting spider.
 
+    Scrapes all start_urls defined in the targets.json sources file and stores
+    extracted regulatory documents into the pipeline (Qdrant by default).
+    """
+    from scrapy.crawler import CrawlerProcess
+    from scrapy.utils.project import get_project_settings as _scrapy_project_settings
+
+    from legal_agent.scraping.spiders.regulatory_spider import RegulatorySpider
     from legal_agent.scraping.settings import (
         BOT_NAME,
         CONCURRENT_REQUESTS,
@@ -47,8 +65,6 @@ def scrape(sources: str | None) -> None:
         DEFAULT_REQUEST_HEADERS,
         DOWNLOAD_DELAY,
         ITEM_PIPELINES,
-        LOG_LEVEL,
-        ROBOTSTXT_OBEY,
     )
 
     settings = get_settings()
@@ -57,19 +73,16 @@ def scrape(sources: str | None) -> None:
     process = CrawlerProcess(
         settings={
             "BOT_NAME": BOT_NAME,
-            "ROBOTSTXT_OBEY": ROBOTSTXT_OBEY,
             "CONCURRENT_REQUESTS": CONCURRENT_REQUESTS,
             "DOWNLOAD_DELAY": DOWNLOAD_DELAY,
             "COOKIES_ENABLED": COOKIES_ENABLED,
             "DEFAULT_REQUEST_HEADERS": DEFAULT_REQUEST_HEADERS,
             "ITEM_PIPELINES": ITEM_PIPELINES,
-            "LOG_LEVEL": LOG_LEVEL,
+            "LOG_LEVEL": log_level.upper(),
         }
     )
-    process.crawl(
-        "legal_agent.scraping.spiders.regulatory_spider.RegulatorySpider",
-        sources_file=sources_file,
-    )
+
+    process.crawl(RegulatorySpider, sources_file=sources_file)
     process.start()
     click.echo("Scraping complete.")
 
@@ -104,6 +117,7 @@ def run_workflow() -> None:
 @cli.command()
 @click.argument("json_file", type=click.Path(exists=True))
 def load_policies(json_file: str) -> None:
+    """Load internal policy documents from a JSON file into Qdrant."""
     settings = get_settings()
     from legal_agent.db.client import client_from_settings
     from legal_agent.utils.models import compute_vectors
@@ -122,8 +136,8 @@ def load_policies(json_file: str) -> None:
         named_vectors = compute_vectors(
             [embed_input],
             settings,
-            dense_name=settings.qdrant_policies_dense_name,  # "internal_policy"
-            sparse_name=settings.qdrant_sparse_name,          # "legal_clause"
+            dense_name=settings.qdrant_policies_dense_name,
+            sparse_name=settings.qdrant_sparse_name,
         )[0]
 
         points.append(
@@ -148,7 +162,7 @@ def load_policies(json_file: str) -> None:
 
 @cli.command()
 def status() -> None:
-    """Show system status: Qdrant collections, unprocessed count."""
+    """Show system status: Qdrant collections and unprocessed document count."""
     settings = get_settings()
     from legal_agent.db.client import client_from_settings
 
