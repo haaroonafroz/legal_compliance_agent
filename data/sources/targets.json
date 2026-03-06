@@ -1,16 +1,9 @@
 [
   {
-    "name": "EU Official Journal",
-    "start_urls": ["https://eur-lex.europa.eu/legal-content/EN/TXT/?uri=OJ:L"],
+    "name": "GDPR Article 17 - Right to Erasure",
+    "start_urls": ["https://gdpr-info.eu/art-17-gdpr/"],
     "jurisdiction": "EU",
-    "allowed_domains": ["eur-lex.europa.eu"],
-    "follow_pdf": true
-  },
-  {
-    "name": "California OAL",
-    "start_urls": ["https://oal.ca.gov/publications/ccr/"],
-    "jurisdiction": "California",
-    "allowed_domains": ["oal.ca.gov"],
-    "follow_pdf": true
+    "allowed_domains": ["gdpr-info.eu"],
+    "follow_pdf": false
   }
 ]

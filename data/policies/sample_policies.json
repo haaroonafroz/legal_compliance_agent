@@ -1,0 +1,29 @@
+[
+    {
+      "policy_id": "POL-DATA-001",
+      "department": "IT",
+      "last_updated": "2025-06-01",
+      "text": "## Data Retention Policy\n\n### Section 1: Scope\nThis policy applies to all personal data processed by the company.\n\n### Section 2: Retention Periods\nCustomer personal data shall be retained for a maximum of 5 years from the date of last interaction. After expiry, data must be securely deleted within 30 days.\n\n### Section 3: Exceptions\nData subject to active litigation or regulatory investigation may be retained beyond the standard period with approval from the Legal department.",
+      "topic_tags": ["data_retention", "personal_data", "data_deletion"],
+      "compliance_domain": "data_protection",
+      "obligation_type": "requirement"
+    },
+    {
+      "policy_id": "POL-PRIV-002",
+      "department": "Legal",
+      "last_updated": "2025-03-15",
+      "text": "## Privacy Notice Policy\n\n### Section 1: Purpose\nAll data collection activities must be accompanied by a clear privacy notice.\n\n### Section 2: Content Requirements\nPrivacy notices must include: identity of the controller, purpose of processing, legal basis, retention period, and data subject rights.\n\n### Section 3: Consent\nWhere consent is the legal basis, it must be freely given, specific, informed and unambiguous. Pre-ticked boxes are not permitted.",
+      "topic_tags": ["privacy_notice", "consent", "data_subject_rights"],
+      "compliance_domain": "data_protection",
+      "obligation_type": "requirement"
+    },
+    {
+      "policy_id": "POL-SEC-003",
+      "department": "Security",
+      "last_updated": "2025-01-10",
+      "text": "## Information Security Policy\n\n### Section 1: Access Control\nAccess to personal data systems must follow the principle of least privilege. All access must be authenticated via multi-factor authentication.\n\n### Section 2: Encryption\nPersonal data must be encrypted at rest using AES-256 and in transit using TLS 1.2 or higher.\n\n### Section 3: Breach Notification\nAny suspected data breach must be reported to the DPO within 24 hours of discovery.",
+      "topic_tags": ["access_control", "encryption", "breach_notification"],
+      "compliance_domain": "data_protection",
+      "obligation_type": "requirement"
+    }
+  ]
