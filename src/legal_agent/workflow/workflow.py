@@ -58,9 +58,6 @@ class ComplianceWorkflow(Workflow):
         from openai import OpenAI
 
         self._openai = OpenAI(api_key=settings.openai_api_key)
-        # #embedding model with dimensions
-        # self._embed_model_name = settings.openai_embedding_model
-        # self._embed_dimensions = settings.openai_embedding_dim
 
     # ------------------------------------------------------------------
     # Step 1 – Horizon Scanner
@@ -176,6 +173,9 @@ class ComplianceWorkflow(Workflow):
         for hit in hits.points:
             matched_policies.append(hit.payload)
             scores.append(hit.score)
+        
+        await ctx.store.set("matched_policies", matched_policies)
+        await ctx.store.set("retrieval_scores", scores)
 
         logger.info("Librarian: found %d matching policies.", len(matched_policies))
         return RetrievedContextEvent(
@@ -205,10 +205,6 @@ class ComplianceWorkflow(Workflow):
             policies_text=policies_text[:6000],
         )
 
-        # response = await self.llm.acomplete(
-        #     prompt,
-        #     system_prompt=ANALYST_SYSTEM,
-        # )
         response = await self.llm.achat(messages=_chat_messages(ANALYST_SYSTEM, prompt))
 
         return AnalysisCompleteEvent(
@@ -225,8 +221,7 @@ class ComplianceWorkflow(Workflow):
         """Draft policy amendments to close identified gaps."""
         logger.info("Redliner: drafting amendments for '%s'…", ev.regulation.source_url)
 
-        prompt = REDLINER_USER.format(gap_analysis=ev.gap_analysis[:8000])
-        # response = await self.llm.acomplete(prompt, system_prompt=REDLINER_SYSTEM)
+        prompt = REDLINER_USER.format(gap_analysis=ev.gap_analysis[:8000], audit_notes=ev.audit_notes if ev.audit_notes else "")
         response = await self.llm.achat(messages=_chat_messages(REDLINER_SYSTEM, prompt))
 
         return DraftCompleteEvent(
@@ -258,8 +253,9 @@ class ComplianceWorkflow(Workflow):
             await ctx.store.set("audit_retries", retries + 1)
             return AnalysisCompleteEvent(
                 regulation=ev.regulation,
-                matched_policies=[],
+                matched_policies=await ctx.store.get("matched_policies", default=[]),
                 gap_analysis=ev.gap_analysis,
+                audit_notes=ev.audit_notes,
             )
 
         logger.info("Auditor: reviewing outputs for '%s'…", ev.regulation.source_url)
@@ -267,7 +263,7 @@ class ComplianceWorkflow(Workflow):
             gap_analysis=ev.gap_analysis[:6000],
             proposed_updates=ev.proposed_updates[:6000],
         )
-        # response = await self.llm.acomplete(prompt, system_prompt=AUDITOR_SYSTEM)
+
         response = await self.llm.achat(messages=_chat_messages(AUDITOR_SYSTEM, prompt))
 
         passed = response.message.content.strip().upper().startswith("PASS")
@@ -280,26 +276,6 @@ class ComplianceWorkflow(Workflow):
             passed=passed,
         )
         return audit_ev
-
-        # retries = await ctx.get("audit_retries", default=0)
-        # if passed or retries >= MAX_AUDIT_RETRIES:
-        #     return FinalReportEvent(
-        #         jurisdiction=ev.regulation.jurisdiction,
-        #         source_url=ev.regulation.source_url,
-        #         gap_analysis=ev.gap_analysis,
-        #         proposed_updates=ev.proposed_updates,
-        #         audit_notes=response.text,
-        #         passed=passed,
-        #     )
-
-        # logger.warning("Audit FAILED – sending back to Analyst for re-analysis.")
-        # # await ctx.set("audit_retries", retries + 1)
-        # await ctx.data["audit_retries"] = retries + 1
-        # return AnalysisCompleteEvent(
-        #     regulation=ev.regulation,
-        #     matched_policies=[],
-        #     gap_analysis=ev.gap_analysis,
-        # )
 
     # ------------------------------------------------------------------
     # Collect final reports
