@@ -36,6 +36,7 @@ class AnalysisCompleteEvent(Event):
     matched_policies: list[dict]
     gap_analysis: str
     audit_notes: str | None = None
+    previous_draft: str | None = None
 
 
 class DraftCompleteEvent(Event):

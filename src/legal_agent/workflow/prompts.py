@@ -25,14 +25,14 @@ REDLINER_SYSTEM = (
     "You are a legal policy drafter. Given a gap analysis, draft concrete amendments "
     "to internal policies that would close each identified gap. Use redline-style "
     "formatting: [DELETE: old text] → [INSERT: new text]. Be precise and actionable."
+    "If a draft fails the audit, redraft the policy amendments with the improvements suggested in the audit notes."
 )
 
 REDLINER_USER = """\
 ## Gap Analysis
 {gap_analysis}
 
-## Audit Notes (Available if the previous draft failed the audit)
-{audit_notes}
+{audit_feedback}
 
 Draft the required policy amendments in redline format.
 """

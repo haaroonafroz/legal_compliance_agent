@@ -220,8 +220,19 @@ class ComplianceWorkflow(Workflow):
     async def redliner(self, ctx: Context, ev: AnalysisCompleteEvent) -> DraftCompleteEvent:
         """Draft policy amendments to close identified gaps."""
         logger.info("Redliner: drafting amendments for '%s'…", ev.regulation.source_url)
-
-        prompt = REDLINER_USER.format(gap_analysis=ev.gap_analysis[:8000], audit_notes=ev.audit_notes if ev.audit_notes else "")
+        audit_feedback = ""
+        if ev.audit_notes and ev.previous_draft:
+            audit_feedback = (
+                "\n## Previous Draft (Rejected by Auditor)\n"
+                f"{ev.previous_draft[:3000]}\n\n"
+                "## Auditor Rejection Notes\n"
+                f"{ev.audit_notes}\n\n"
+                "Revise the draft above to address the auditor's specific objections.\n"
+            )
+        prompt = REDLINER_USER.format(
+            gap_analysis=ev.gap_analysis[:8000],
+            audit_feedback=audit_feedback,
+        )
         response = await self.llm.achat(messages=_chat_messages(REDLINER_SYSTEM, prompt))
 
         return DraftCompleteEvent(
@@ -256,6 +267,7 @@ class ComplianceWorkflow(Workflow):
                 matched_policies=await ctx.store.get("matched_policies", default=[]),
                 gap_analysis=ev.gap_analysis,
                 audit_notes=ev.audit_notes,
+                previous_draft=ev.proposed_updates,
             )
 
         logger.info("Auditor: reviewing outputs for '%s'…", ev.regulation.source_url)
