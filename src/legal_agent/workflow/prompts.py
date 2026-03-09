@@ -31,6 +31,9 @@ REDLINER_USER = """\
 ## Gap Analysis
 {gap_analysis}
 
+## Audit Notes (Available if the previous draft failed the audit)
+{audit_notes}
+
 Draft the required policy amendments in redline format.
 """
 
