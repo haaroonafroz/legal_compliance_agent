@@ -35,6 +35,7 @@ class AnalysisCompleteEvent(Event):
     regulation: NewLawEvent
     matched_policies: list[dict]
     gap_analysis: str
+    audit_notes: str | None = None
 
 
 class DraftCompleteEvent(Event):
