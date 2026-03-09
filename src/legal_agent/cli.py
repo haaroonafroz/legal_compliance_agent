@@ -93,25 +93,35 @@ def run_workflow() -> None:
     settings = get_settings()
 
     from legal_agent.instrumentation import init_observability
+    from langfuse import get_client, propagate_attributes
+    from legal_agent.workflow import ComplianceWorkflow
+    from legal_agent.utils.report import save_report
+    import datetime
 
     init_observability(settings)
 
-    from legal_agent.workflow import ComplianceWorkflow
-
     async def _run() -> None:
         wf = ComplianceWorkflow(settings=settings, timeout=300)
-        result = await wf.run()
+        with propagate_attributes(
+            session_id=f"batch-{datetime.date.today().isoformat()}",
+            tags=["compliance-workflow", settings.openai_llm_model],
+            version="0.1.0",
+        ):
+            result = await wf.run()
 
         if isinstance(result, dict) and result.get("reports") == []:
             click.echo("No unprocessed regulations found.")
             return
-
-        from legal_agent.utils.report import save_report
-
         path = save_report(result)
         click.echo(f"Report saved to {path}")
 
     asyncio.run(_run())
+
+    try:
+        get_client().flush()
+        logger.info("Langfuse spans flushed.")
+    except Exception:
+        pass
 
 
 @cli.command()
