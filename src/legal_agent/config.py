@@ -16,12 +16,12 @@ class Settings(BaseSettings):
     # Qdrant
     qdrant_url: str = os.getenv("QDRANT_URL")
     qdrant_api_key: str = os.getenv("QDRANT_API_KEY")
-    qdrant_regulatory_collection: str = "regulatory_updates"
-    qdrant_policies_collection: str = "internal_policies"
+    qdrant_regulatory_collection: str = os.getenv("REGULATORY_COLLECTION", "regulatory_updates")
+    qdrant_policies_collection: str = os.getenv("POLICIES_COLLECTION", "internal_policies")
     # Named vector field names (must match Qdrant collection definition)
-    qdrant_regulatory_dense_name: str = "compliance"
-    qdrant_policies_dense_name: str = "internal_policy"
-    qdrant_sparse_name: str = "legal_clause"
+    qdrant_regulatory_dense_name: str = os.getenv("COMPLIANCE_DENSE_NAME", "compliance")
+    qdrant_policies_dense_name: str = os.getenv("POLICY_DENSE_NAME", "internal_policy")
+    qdrant_sparse_name: str = os.getenv("POLICY_SPARSE_NAME", "legal_clause")
     # FastEmbed
     sparse_embedding_model: str = "Qdrant/bm42-all-minilm-l6-v2-attentions"
 
@@ -38,9 +38,9 @@ class Settings(BaseSettings):
     use_legal_slm: bool = False
 
     # Langfuse
-    langfuse_public_key: str = os.getenv("LANGFUSE_PUBLIC_KEY")
-    langfuse_secret_key: str = os.getenv("LANGFUSE_SECRET_KEY")
-    langfuse_host: str = "https://cloud.langfuse.com"
+    langfuse_public_key: str = os.getenv("LANGFUSE_PUBLIC_KEY", '')
+    langfuse_secret_key: str = os.getenv("LANGFUSE_SECRET_KEY", '')
+    langfuse_host: str = os.getenv("LANGFUSE_HOST", "https://cloud.langfuse.com") 
 
     # Arize Phoenix
     phoenix_endpoint: str = os.getenv("PHOENIX_ENDPOINT")
