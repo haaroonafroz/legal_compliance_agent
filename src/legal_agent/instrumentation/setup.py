@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+import os
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -32,25 +33,45 @@ def _init_langfuse(settings: "Settings") -> None:
         logger.warning("Langfuse secret key not set – skipping Langfuse init.")
         return
 
-    from langfuse import Langfuse
+    # The Python SDK v3 reads these env vars automatically and sets up the
+    # OTel TracerProvider + exporter to send spans to Langfuse.
+    os.environ["LANGFUSE_PUBLIC_KEY"] = settings.langfuse_public_key
+    os.environ["LANGFUSE_SECRET_KEY"] = settings.langfuse_secret_key
+    os.environ["LANGFUSE_BASE_URL"] = settings.langfuse_host
 
-    langfuse = Langfuse(
-        public_key=settings.langfuse_public_key,
-        secret_key=settings.langfuse_secret_key,
-        host=settings.langfuse_host,
-    )
-    langfuse.auth_check()
-    logger.info("Langfuse connected at %s", settings.langfuse_host)
+    from langfuse import get_client
+
+    langfuse = get_client()
+    if langfuse.auth_check():
+        logger.info("Langfuse connected at %s", settings.langfuse_host)
+    else:
+        logger.warning("Langfuse auth_check failed – check your keys and host.")
 
 
 def _init_phoenix(settings: "Settings") -> None:
     try:
         import phoenix as px
         from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry import trace as otel_trace
+        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
-        px.launch_app() if settings.phoenix_endpoint == "http://localhost:6006" else None
+        # Launch local Phoenix server if using localhost endpoint
+        if "localhost" in settings.phoenix_endpoint:
+            px.launch_app()
+
+        # Add Phoenix as a second OTel exporter so spans go to BOTH
+        # Langfuse (already configured above) and Phoenix simultaneously.
+        phoenix_exporter = OTLPSpanExporter(
+            endpoint=f"{settings.phoenix_endpoint}/v1/traces"
+        )
+        provider = otel_trace.get_tracer_provider()
+        provider.add_span_processor(SimpleSpanProcessor(phoenix_exporter))
+
+        # Instrument LlamaIndex – this hooks into the OTel provider that
+        # Langfuse already configured, so all @step spans flow to Langfuse.
         LlamaIndexInstrumentor().instrument()
-        logger.info("Arize Phoenix instrumentation active.")
+        logger.info("Arize Phoenix instrumentation active at %s", settings.phoenix_endpoint)
     except Exception:
         logger.warning("Phoenix init failed – RAG metrics unavailable.", exc_info=True)
 
@@ -62,7 +83,8 @@ def _init_langwatch(settings: "Settings") -> None:
     try:
         import langwatch
 
-        langwatch.login(api_key=settings.langwatch_api_key)
+        # langwatch>=0.2.0 uses setup(), not login()
+        langwatch.setup(api_key=settings.langwatch_api_key)
         logger.info("LangWatch guardrails active.")
     except Exception:
         logger.warning("LangWatch init failed.", exc_info=True)
