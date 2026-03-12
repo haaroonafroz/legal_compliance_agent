@@ -12,3 +12,4 @@ data/reports/
 .ruff_cache/
 .pytest_cache/
 cluster_definition.txt
+*langfuse-local*
