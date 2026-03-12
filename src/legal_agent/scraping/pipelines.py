@@ -11,6 +11,7 @@ from typing import Any
 import json
 import torch
 from openai import OpenAI
+from transformers import AutoTokenizer
 from legal_agent.config import get_settings
 from legal_agent.workflow.prompts import _ENRICHMENT_FEW_SHOT
 from legal_agent.scraping.items import ChunkedRegulationItem, RegulatoryDocumentItem
@@ -57,42 +58,100 @@ class DoclingPdfPipeline:
 _HEADING_RE = re.compile(r"^(#{1,6})\s+(.+)$", re.MULTILINE)
 
 
-class ChunkingPipeline:
-    """Split full_text into hierarchical chunks with header_path metadata."""
+_SENTENCE_SPLIT_RE = re.compile(r"(?<=[.!?])\s+(?=[A-Z0-9(\[])")
+_CLAUSE_SPLIT_RE = re.compile(r"(?<=[;:])\s+|(?<=,)\s+(?=(?:and|or|but)\b)", re.IGNORECASE)
 
-    def __init__(self, max_tokens: int = 512):
+
+class ChunkingPipeline:
+    """Split full_text into token-aware hierarchical chunks with linked chunk metadata."""
+
+    def __init__(self, tokenizer_model: str, max_tokens: int = 512):
+        self.tokenizer_model = tokenizer_model
         self.max_tokens = max_tokens
+        self.tokenizer = None
+
+    @classmethod
+    def from_crawler(cls, crawler):
+        settings = get_settings()
+        return cls(
+            tokenizer_model=settings.chunking_tokenizer_model,
+            max_tokens=settings.chunk_max_tokens,
+        )
+
+    def open_spider(self, spider):
+        self.tokenizer = AutoTokenizer.from_pretrained(self.tokenizer_model, use_fast=True)
 
     def process_item(
         self, item: RegulatoryDocumentItem, spider: Any
     ) -> list[ChunkedRegulationItem]:
-        text: str = item.get("full_text", "")
+        if not isinstance(item, RegulatoryDocumentItem):
+            return item
+
+        text: str = item.get("full_text", "").strip()
         if not text:
             return []
 
-        sections = self._split_by_headings(text)
-        chunks: list[ChunkedRegulationItem] = []
+        normalized_text = self._normalize_text(text)
+        document_hash = hashlib.sha256(normalized_text.encode("utf-8")).hexdigest()
+        document_id = hashlib.sha256(
+            f"{item['source_url']}:{document_hash}".encode("utf-8")
+        ).hexdigest()[:32]
 
-        for idx, (header_path, section_text) in enumerate(sections):
-            for sub_idx, chunk_text in enumerate(self._split_large(section_text)):
-                chunks.append(
-                    ChunkedRegulationItem(
-                        text=chunk_text,
-                        header_path=header_path,
-                        source_url=item["source_url"],
-                        jurisdiction=item["jurisdiction"],
-                        effective_date=item.get("effective_date", ""),
-                        is_processed=False,
-                        chunk_index=len(chunks),
-                    )
+        sections = self._split_by_headings(text)
+        raw_chunks: list[dict[str, Any]] = []
+
+        for header_path, section_text in sections:
+            for chunk_text in self._split_large(section_text):
+                if not chunk_text.strip():
+                    continue
+                raw_chunks.append(
+                    {
+                        "text": chunk_text.strip(),
+                        "header_path": header_path,
+                        "token_count": self._count_tokens(chunk_text),
+                    }
                 )
 
-        logger.info("Chunked '%s' into %d pieces.", item.get("title", ""), len(chunks))
-        return chunks  # type: ignore[return-value]
+        chunk_count = len(raw_chunks)
+        chunks: list[ChunkedRegulationItem] = []
+
+        for idx, raw in enumerate(raw_chunks):
+            chunk_id = f"{document_id}:{idx}"
+            prev_chunk_id = f"{document_id}:{idx - 1}" if idx > 0 else ""
+            next_chunk_id = f"{document_id}:{idx + 1}" if idx < chunk_count - 1 else ""
+
+            chunks.append(
+                ChunkedRegulationItem(
+                    text=raw["text"],
+                    header_path=raw["header_path"],
+                    source_url=item["source_url"],
+                    jurisdiction=item["jurisdiction"],
+                    effective_date=item.get("effective_date", ""),
+                    is_processed=False,
+                    document_id=document_id,
+                    document_hash=document_hash,
+                    chunk_id=chunk_id,
+                    prev_chunk_id=prev_chunk_id,
+                    next_chunk_id=next_chunk_id,
+                    chunk_index=idx,
+                    chunk_count=chunk_count,
+                    token_count=raw["token_count"],
+                    topic_tags=item.get("topic_tags", []),
+                    compliance_domain=item.get("compliance_domain", ""),
+                    applies_to_departments=item.get("applies_to_departments", []),
+                    obligation_type=item.get("obligation_type", ""),
+                )
+            )
+
+        logger.info("Chunked '%s' into %d linked pieces.", item.get("title", ""), len(chunks))
+        return chunks
+
+    @staticmethod
+    def _normalize_text(text: str) -> str:
+        return re.sub(r"\s+", " ", text).strip()
 
     @staticmethod
     def _split_by_headings(text: str) -> list[tuple[str, str]]:
-        """Return (header_path, body) tuples following heading hierarchy."""
         parts: list[tuple[str, str]] = []
         heading_stack: list[str] = []
         current_level = 0
@@ -103,7 +162,7 @@ class ChunkingPipeline:
             title = m.group(2).strip()
 
             if last_pos < m.start():
-                body = text[last_pos : m.start()].strip()
+                body = text[last_pos:m.start()].strip()
                 if body:
                     path = " > ".join(heading_stack) if heading_stack else "Preamble"
                     parts.append((path, body))
@@ -112,6 +171,7 @@ class ChunkingPipeline:
                 heading_stack.append(title)
             else:
                 heading_stack = heading_stack[: level - 1] + [title]
+
             current_level = level
             last_pos = m.end()
 
@@ -125,14 +185,99 @@ class ChunkingPipeline:
 
         return parts
 
+    def _count_tokens(self, text: str) -> int:
+        return len(self.tokenizer.encode(text, add_special_tokens=False))
+
     def _split_large(self, text: str) -> list[str]:
-        words = text.split()
-        if len(words) <= self.max_tokens:
+        text = text.strip()
+        if not text:
+            return []
+
+        if self._count_tokens(text) <= self.max_tokens:
             return [text]
-        chunks = []
-        for i in range(0, len(words), self.max_tokens):
-            chunks.append(" ".join(words[i : i + self.max_tokens]))
+
+        units = self._split_into_units(text)
+        chunks: list[str] = []
+        current_parts: list[str] = []
+
+        for unit in units:
+            unit = unit.strip()
+            if not unit:
+                continue
+
+            if self._count_tokens(unit) > self.max_tokens:
+                if current_parts:
+                    chunks.append("\n".join(current_parts).strip())
+                    current_parts = []
+                chunks.extend(self._split_oversized_unit(unit))
+                continue
+
+            candidate = "\n".join(current_parts + [unit]).strip() if current_parts else unit
+            if self._count_tokens(candidate) <= self.max_tokens:
+                current_parts.append(unit)
+            else:
+                chunks.append("\n".join(current_parts).strip())
+                current_parts = [unit]
+
+        if current_parts:
+            chunks.append("\n".join(current_parts).strip())
+
         return chunks
+
+    def _split_into_units(self, text: str) -> list[str]:
+        paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text) if p.strip()]
+        units: list[str] = []
+
+        for paragraph in paragraphs:
+            if self._count_tokens(paragraph) <= self.max_tokens:
+                units.append(paragraph)
+                continue
+
+            sentences = [s.strip() for s in _SENTENCE_SPLIT_RE.split(paragraph) if s.strip()]
+            if len(sentences) == 1:
+                units.append(paragraph)
+            else:
+                units.extend(sentences)
+
+        return units
+
+    def _split_oversized_unit(self, text: str) -> list[str]:
+        clauses = [c.strip() for c in _CLAUSE_SPLIT_RE.split(text) if c.strip()]
+        if len(clauses) > 1:
+            chunks: list[str] = []
+            current_parts: list[str] = []
+
+            for clause in clauses:
+                candidate = " ".join(current_parts + [clause]).strip() if current_parts else clause
+                if self._count_tokens(candidate) <= self.max_tokens:
+                    current_parts.append(clause)
+                else:
+                    if current_parts:
+                        chunks.append(" ".join(current_parts).strip())
+                    if self._count_tokens(clause) <= self.max_tokens:
+                        current_parts = [clause]
+                    else:
+                        chunks.extend(self._hard_split_tokens(clause))
+                        current_parts = []
+
+            if current_parts:
+                chunks.append(" ".join(current_parts).strip())
+
+            return chunks
+
+        return self._hard_split_tokens(text)
+
+    def _hard_split_tokens(self, text: str) -> list[str]:
+        token_ids = self.tokenizer.encode(text, add_special_tokens=False)
+        chunks: list[str] = []
+
+        for start in range(0, len(token_ids), self.max_tokens):
+            window = token_ids[start:start + self.max_tokens]
+            if not window:
+                continue
+            chunks.append(self.tokenizer.decode(window, skip_special_tokens=True).strip())
+
+        return [chunk for chunk in chunks if chunk]
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +289,7 @@ class MetadataEnrichmentPipeline:
         self._tokenizer = None
         self._model = None
         self._settings = None
+
     def open_spider(self, spider):
         self._settings = get_settings()
         if self._settings.use_legal_slm:
@@ -152,14 +298,17 @@ class MetadataEnrichmentPipeline:
                 self._settings.legal_slm_device,
                 self._settings.legal_slm_load_in_4bit,
             )
+
     def process_item(self, item, spider):
-        if isinstance(item, list):
-            return [self._enrich(chunk) for chunk in item]
-        if isinstance(item, ChunkedRegulationItem):
-            return self._enrich(item)
+        if isinstance(item, RegulatoryDocumentItem):
+            return self._enrich_document(item)
         return item
-    def _enrich(self, chunk):
-        text = chunk["text"][:2000]
+
+    def _enrich_document(self, item: RegulatoryDocumentItem) -> RegulatoryDocumentItem:
+        full_text = item.get("full_text", "")
+        if not full_text:
+            return item
+        text = self._prepare_enrichment_text(full_text)
         defaults = {
             "topic_tags": [],
             "compliance_domain": "",
@@ -172,12 +321,24 @@ class MetadataEnrichmentPipeline:
             else:
                 meta = self._extract_with_openai(text)
             for key in defaults:
-                chunk[key] = meta.get(key, defaults[key])
+                item[key] = meta.get(key, defaults[key])
         except Exception:
             logger.warning("Metadata enrichment failed, using defaults.", exc_info=True)
             for key, val in defaults.items():
-                chunk[key] = val
-        return chunk
+                item[key] = val
+        return item
+        
+    @staticmethod
+    def _prepare_enrichment_text(full_text: str, max_chars: int = 12000) -> str:
+        full_text = full_text.strip()
+        if len(full_text) <= max_chars:
+            return full_text
+        head = full_text[:4000]
+        middle_start = max(0, len(full_text) // 2 - 2000)
+        middle = full_text[middle_start:middle_start + 4000]
+        tail = full_text[-4000:]
+        return f"{head}\n\n[...]\n\n{middle}\n\n[...]\n\n{tail}"
+
     def _extract_with_slm(self, text: str) -> dict:
         prompt = _ENRICHMENT_FEW_SHOT.replace("{text}", text)
         inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
@@ -194,10 +355,11 @@ class MetadataEnrichmentPipeline:
             outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )
         return json.loads(generated.strip())
+
     def _extract_with_openai(self, text: str) -> dict:
         client = OpenAI(api_key=self._settings.openai_api_key)
         resp = client.chat.completions.create(
-            model=self._settings.openai_llm_model,
+            model=self._settings.openai_llm_model_enrichment,
             messages=[
                 {"role": "system", "content": "You are a legal metadata tagger. Output JSON only."},
                 {"role": "user", "content": _ENRICHMENT_FEW_SHOT.replace("{text}", text)},
@@ -206,6 +368,7 @@ class MetadataEnrichmentPipeline:
             temperature=0,
         )
         return json.loads(resp.choices[0].message.content)
+
 # ---------------------------------------------------------------------------
 # Pipeline 4 – Upsert into Qdrant
 # ---------------------------------------------------------------------------
@@ -235,18 +398,14 @@ class QdrantPipeline:
         domain = chunk.get("compliance_domain", "")
         tags = chunk.get("topic_tags", [])
         embed_input = f"[{domain}] [{', '.join(tags)}] {text}"
-        
         named_vectors = compute_vectors(
             [embed_input],
             self._settings,
-            dense_name=self._settings.qdrant_regulatory_dense_name,  # "compliance"
-            sparse_name=self._settings.qdrant_sparse_name,            # "legal_clause"
+            dense_name=self._settings.qdrant_regulatory_dense_name,
+            sparse_name=self._settings.qdrant_sparse_name,
         )[0]
-        point_id = hashlib.sha256(
-            f"{chunk['source_url']}:{chunk['chunk_index']}".encode()
-        ).hexdigest()[:32]
+        point_id = hashlib.sha256(chunk["chunk_id"].encode("utf-8")).hexdigest()[:32]
         point_id_int = int(point_id, 16) % (2**63)
-
         self._client.upsert(
             collection_name=self._collection,
             points=[
@@ -260,7 +419,14 @@ class QdrantPipeline:
                         "jurisdiction": chunk["jurisdiction"],
                         "effective_date": chunk["effective_date"],
                         "is_processed": False,
+                        "document_id": chunk["document_id"],
+                        "document_hash": chunk["document_hash"],
+                        "chunk_id": chunk["chunk_id"],
+                        "prev_chunk_id": chunk["prev_chunk_id"],
+                        "next_chunk_id": chunk["next_chunk_id"],
                         "chunk_index": chunk["chunk_index"],
+                        "chunk_count": chunk["chunk_count"],
+                        "token_count": chunk["token_count"],
                         "topic_tags": chunk.get("topic_tags", []),
                         "compliance_domain": chunk.get("compliance_domain", ""),
                         "applies_to_departments": chunk.get("applies_to_departments", []),
