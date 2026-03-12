@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     # OpenAI
     openai_api_key: str = os.getenv("OPENAI_API_KEY")
     openai_llm_model: str = os.getenv("OPENAI_LLM_MODEL")
+    openai_llm_model_enrichment: str = os.getenv("OPENAI_LLM_MODEL_ENRICHMENT")
     openai_embedding_model: str = os.getenv("OPENAI_EMBEDDING_MODEL")
     openai_embedding_dim: int = 768
 
@@ -54,6 +55,7 @@ class Settings(BaseSettings):
     # Chunking
     chunk_max_tokens: int = 512
     chunk_overlap_tokens: int = 64
+    chunking_tokenizer_model: str = "nlpaueb/legal-bert-base-uncased"
 
 
 def get_settings() -> Settings:
