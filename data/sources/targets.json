@@ -1,9 +1,13 @@
 [
   {
-    "name": "GDPR Article 17 - Right to Erasure",
-    "start_urls": ["https://gdpr-info.eu/art-17-gdpr/"],
+    "name": "European Data Protection Board – Guidelines",
     "jurisdiction": "EU",
-    "allowed_domains": ["gdpr-info.eu"],
-    "follow_pdf": false
+    "start_urls": ["https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/guidelines_en"],
+    "allowed_domains": ["edpb.europa.eu"],
+    "follow_links": true,
+    "follow_pdf": true,
+    "max_depth": 2,
+    "max_pages": 30,
+    "max_pdfs": 10
   }
 ]

@@ -9,12 +9,16 @@ from pydantic import Field
 class NewLawEvent(Event):
     """Emitted by the Horizon Scanner after grouping unprocessed regulation chunks."""
 
+    document_id: str
+    document_hash: str
     regulation_text: str
+    regulation_chunks: list[str] = Field(default_factory=list)
     header_path: str
     jurisdiction: str
     source_url: str
     effective_date: str
     chunk_ids: list[int] = Field(default_factory=list)
+    chunk_count: int = 0
     topic_tags: list[str] = Field(default_factory=list)
     compliance_domain: str = ""
     applies_to_departments: list[str] = Field(default_factory=list)
@@ -60,6 +64,7 @@ class AuditResultEvent(Event):
 class FinalReportEvent(Event):
     """Terminal event containing the complete compliance report for one regulation."""
 
+    document_id: str
     jurisdiction: str
     source_url: str
     gap_analysis: str
