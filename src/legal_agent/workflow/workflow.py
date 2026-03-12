@@ -64,7 +64,7 @@ class ComplianceWorkflow(Workflow):
     # ------------------------------------------------------------------
     @step
     async def horizon_scanner(self, ctx: Context, ev: StartEvent) -> NewLawEvent | StopEvent:
-        """Pull unprocessed regulatory chunks from Qdrant and group them."""
+        """Pull unprocessed regulatory chunks from Qdrant, validate sequence integrity, and rebuild full documents."""
         logger.info("Horizon Scanner: fetching unprocessed regulations…")
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
@@ -85,26 +85,58 @@ class ComplianceWorkflow(Workflow):
 
         grouped: dict[str, list] = {}
         for pt in points:
-            key = pt.payload["source_url"]
-            grouped.setdefault(key, []).append(pt)
+            payload = pt.payload or {}
+            document_id = payload.get("document_id")
+            if not document_id:
+                logger.warning("Skipping point without document_id: %s", pt.id)
+                continue
+            grouped.setdefault(document_id, []).append(pt)
+
+        if not grouped:
+            logger.info("No valid unprocessed regulatory documents found.")
+            return StopEvent(result={"reports": []})
 
         reports = []
         await ctx.store.set("reports", reports)
         await ctx.store.set("grouped_keys", list(grouped.keys()))
         await ctx.store.set("pending_count", len(grouped))
 
-        for source_url, chunks in grouped.items():
+        for document_id, chunks in grouped.items():
             chunks.sort(key=lambda p: p.payload.get("chunk_index", 0))
-            combined_text = "\n\n".join(c.payload["text"] for c in chunks)
             first = chunks[0].payload
+            expected_chunk_count = first.get("chunk_count", len(chunks))
+            document_hash = first.get("document_hash", "")
+
+            indices = [c.payload.get("chunk_index") for c in chunks]
+            expected_indices = list(range(expected_chunk_count))
+
+            if len(chunks) != expected_chunk_count or indices != expected_indices:
+                logger.warning(
+                    "Skipping incomplete document %s: have %d/%d chunks with indices %s",
+                    document_id,
+                    len(chunks),
+                    expected_chunk_count,
+                    indices,
+                )
+                continue
+
+            if any(c.payload.get("document_hash") != document_hash for c in chunks):
+                logger.warning("Skipping inconsistent document_hash set for %s", document_id)
+                continue
+
+            combined_text = "\n\n".join(c.payload["text"] for c in chunks)
 
             return NewLawEvent(
+                document_id=document_id,
+                document_hash=document_hash,
                 regulation_text=combined_text,
+                regulation_chunks=[c.payload["text"] for c in chunks],
                 header_path=first.get("header_path", ""),
                 jurisdiction=first.get("jurisdiction", ""),
-                source_url=source_url,
+                source_url=first.get("source_url", ""),
                 effective_date=first.get("effective_date", ""),
                 chunk_ids=[c.id for c in chunks],
+                chunk_count=expected_chunk_count,
                 topic_tags=first.get("topic_tags", []),
                 compliance_domain=first.get("compliance_domain", ""),
                 applies_to_departments=first.get("applies_to_departments", []),
@@ -128,12 +160,12 @@ class ComplianceWorkflow(Workflow):
 
         domain = ev.compliance_domain
         tags = ev.topic_tags
-        embed_input = f"[{domain}] [{', '.join(tags)}] {ev.regulation_text[:8000]}"
-
-        # Compute both vector types
-        dense_vector = embed_texts([embed_input], self.settings)[0]
-        indices, values = sparse_encode_texts([embed_input], self.settings)[0]
-
+        chunk_inputs = [
+            f"[{domain}] [{', '.join(tags)}] {chunk_text}"
+            for chunk_text in ev.regulation_chunks
+        ]
+        dense_vectors = embed_texts(chunk_inputs, self.settings)
+        sparse_pairs = sparse_encode_texts(chunk_inputs, self.settings)
         # Build optional metadata filter
         filter_conditions = []
         if tags:
@@ -147,22 +179,27 @@ class ComplianceWorkflow(Workflow):
         query_filter = Filter(should=filter_conditions) if filter_conditions else None
 
         # Hybrid search: prefetch from both dense and sparse, then fuse with RRF
-        hits = self.qdrant.query_points(
-            collection_name=self.settings.qdrant_policies_collection,
-            prefetch=[
+        prefetches = []
+        for dense_vector, (indices, values) in zip(dense_vectors, sparse_pairs):
+            prefetches.append(
                 Prefetch(
                     query=dense_vector,
-                    using=self.settings.qdrant_policies_dense_name,  # "internal_policy"
+                    using=self.settings.qdrant_policies_dense_name,
                     limit=20,
                     filter=query_filter,
-                ),
+                )
+            )
+            prefetches.append(
                 Prefetch(
                     query=SparseVector(indices=indices, values=values),
-                    using=self.settings.qdrant_sparse_name,           # "legal_clause"
+                    using=self.settings.qdrant_sparse_name,
                     limit=20,
                     filter=query_filter,
-                ),
-            ],
+                )
+            )
+        hits = self.qdrant.query_points(
+            collection_name=self.settings.qdrant_policies_collection,
+            prefetch=prefetches,
             query=FusionQuery(fusion="rrf"),
             limit=10,
             with_payload=True,
@@ -253,6 +290,7 @@ class ComplianceWorkflow(Workflow):
             retries = await ctx.store.get("audit_retries", default=0)
             if ev.passed or retries >= MAX_AUDIT_RETRIES:
                 return FinalReportEvent(
+                    document_id=ev.regulation.document_id,
                     jurisdiction=ev.regulation.jurisdiction,
                     source_url=ev.regulation.source_url,
                     gap_analysis=ev.gap_analysis,
@@ -303,12 +341,13 @@ class ComplianceWorkflow(Workflow):
             collection_name=self.settings.qdrant_regulatory_collection,
             payload={"is_processed": True},
             points=Filter(
-                must=[FieldCondition(key="source_url", match=MatchValue(value=ev.source_url))]
+                must=[FieldCondition(key="document_id", match=MatchValue(value=ev.document_id))]
             ),
         )
 
         return StopEvent(
             result={
+                "document_id": ev.document_id,
                 "jurisdiction": ev.jurisdiction,
                 "source_url": ev.source_url,
                 "gap_analysis": ev.gap_analysis,
