@@ -137,6 +137,7 @@ class _JobState:
         "follow_links", "follow_pdf",
         "max_depth", "max_pages", "max_pdfs",
         "pages_seen", "pdfs_seen",
+        "html_requests_pending", "pdf_requests_pending",
     )
 
     def __init__(
@@ -160,8 +161,15 @@ class _JobState:
         self.max_pdfs = max_pdfs     # 0 = unlimited
         self.pages_seen = 0
         self.pdfs_seen = 0
+        self.html_requests_pending = 0
+        self.pdf_requests_pending = 0
 
     # -- quota helpers --------------------------------------------------
+    def html_slot_available(self) -> bool:
+        return self.max_pages == 0 or (self.pages_seen + self.html_requests_pending) < self.max_pages
+
+    def pdf_slot_available(self) -> bool:
+        return self.max_pdfs == 0 or (self.pdfs_seen + self.pdf_requests_pending) < self.max_pdfs
 
     def page_allowed(self) -> bool:
         return self.max_pages == 0 or self.pages_seen < self.max_pages
@@ -325,8 +333,12 @@ class RegulatorySpider(scrapy.Spider):
         content_type = response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore")
 
         if "application/pdf" in content_type:
+            if depth > 0:  # not a start_url
+                job.pdf_requests_pending = max(0, job.pdf_requests_pending - 1)
             yield from self._handle_pdf(response, job)
         else:
+            if depth > 0:
+                job.html_requests_pending = max(0, job.html_requests_pending - 1)
             yield from self._handle_html(response, job, depth)
 
     # ------------------------------------------------------------------
@@ -338,12 +350,11 @@ class RegulatorySpider(scrapy.Spider):
         response: Response,
         job: _JobState,
     ) -> Iterator[RegulatoryDocumentItem]:
-        if not job.pdf_allowed():
-            logger.info(
-                "PDF quota (%d) reached – skipping %s",
-                job.max_pdfs, response.url,
-            )
-            return
+        if not job.pdf_slot_available():
+            logger.info("PDF quota reached – stopping PDF link collection.")
+            break
+        job.pdf_requests_pending += 1
+        yield scrapy.Request(...)
 
         job.claim_pdf()
         logger.info(
@@ -391,12 +402,11 @@ class RegulatorySpider(scrapy.Spider):
         job_key: str = response.meta["job_key"]
 
         # -- page quota -------------------------------------------------
-        if not job.page_allowed():
-            logger.info(
-                "Page quota (%d) reached – skipping %s",
-                job.max_pages, response.url,
-            )
-            return
+        if not job.html_slot_available():
+            logger.info("Page quota (%d) reached – stopping HTML link collection.", job.max_pages)
+            break
+        job.html_requests_pending += 1
+        yield scrapy.Request(...)
 
         job.claim_page()
         logger.info(

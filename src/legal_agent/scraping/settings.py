@@ -21,4 +21,4 @@ ITEM_PIPELINES = {
     "legal_agent.scraping.pipelines.QdrantPipeline": 300,
 }
 
-LOG_LEVEL = "INFO"
+LOG_LEVEL = "ERROR"
