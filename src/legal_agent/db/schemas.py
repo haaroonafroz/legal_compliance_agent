@@ -35,11 +35,14 @@ REGULATORY_PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
 
 POLICIES_PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
     "department": PayloadSchemaType.KEYWORD,
+    "departments": PayloadSchemaType.KEYWORD,  # multi-department support
     "policy_id": PayloadSchemaType.KEYWORD,
-    "topic_tags": PayloadSchemaType.KEYWORD,
+    "document_id": PayloadSchemaType.KEYWORD,
+    "chunk_id": PayloadSchemaType.KEYWORD,
+    # "topic_tags": PayloadSchemaType.KEYWORD,
     "compliance_domain": PayloadSchemaType.KEYWORD,
-    "obligation_type": PayloadSchemaType.KEYWORD,
-}
+    # "obligation_type": PayloadSchemaType.KEYWORD,
+}   
 
 
 def ensure_collections(client, settings):
