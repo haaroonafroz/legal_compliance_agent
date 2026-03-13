@@ -124,50 +124,58 @@ def run_workflow() -> None:
         pass
 
 
-@cli.command()
-@click.argument("json_file", type=click.Path(exists=True))
-def load_policies(json_file: str) -> None:
-    """Load internal policy documents from a JSON file into Qdrant."""
+@cli.command("load-policies-pdf")
+@click.argument("pdf_file", default="data\policies\dl-binding-corporate-rules-privacy.pdf", type=click.Path(exists=True, dir_okay=False))
+@click.option(
+    "--department", default="",
+    help=(
+        "Hard-override department for every chunk (e.g. 'Legal', 'HR'). "
+        "When omitted the enrichment model infers it per chunk."
+    ),
+)
+@click.option(
+    "--domain", default="",
+    help=(
+        "Hard-override compliance_domain (e.g. 'GDPR', 'ISO27001'). "
+        "When omitted the enrichment model infers it per chunk."
+    ),
+)
+@click.option(
+    "--batch-size", default=32, show_default=True,
+    help="Chunks per embedding + Qdrant upsert batch.",
+)
+def load_policies_pdf(
+    pdf_file: str,
+    department: str,
+    domain: str,
+    batch_size: int,
+) -> None:
+    from pathlib import Path
+    from legal_agent.utils.loader import ingest_policy_pdf
+ 
     settings = get_settings()
-    from legal_agent.db.client import client_from_settings
-    from legal_agent.utils.models import compute_vectors
-
-    client = client_from_settings(settings)
-    policies = json.loads(open(json_file, encoding="utf-8").read())
-    from qdrant_client.models import PointStruct
-
-    points = []
-    for idx, policy in enumerate(policies):
-        text = policy["text"][:8000]
-        domain = policy.get("compliance_domain", "")
-        tags = policy.get("topic_tags", [])
-        embed_input = f"[{domain}] [{', '.join(tags)}] {text}"
-
-        named_vectors = compute_vectors(
-            [embed_input],
-            settings,
-            dense_name=settings.qdrant_policies_dense_name,
-            sparse_name=settings.qdrant_sparse_name,
-        )[0]
-
-        points.append(
-            PointStruct(
-                id=idx,
-                vector=named_vectors,
-                payload={
-                    "text": policy["text"],
-                    "policy_id": policy.get("policy_id", f"POL-{idx:04d}"),
-                    "department": policy.get("department", "General"),
-                    "last_updated": policy.get("last_updated", ""),
-                    "topic_tags": tags,
-                    "compliance_domain": domain,
-                    "obligation_type": policy.get("obligation_type", ""),
-                },
-            )
-        )
-
-    client.upsert(collection_name=settings.qdrant_policies_collection, points=points)
-    click.echo(f"Loaded {len(points)} policies into '{settings.qdrant_policies_collection}'.")
+    pdf_path = Path(pdf_file)
+ 
+    click.echo(f"Ingesting '{pdf_path.name}' …")
+    click.echo(f"  Target collection : {settings.qdrant_policies_collection}")
+    click.echo(
+        f"  Enrichment model  : "
+        f"{'SLM (' + settings.legal_slm_model + ')' if settings.use_legal_slm else settings.openai_llm_model_enrichment}"
+    )
+    if department:
+        click.echo(f"  Department override : {department}")
+    if domain:
+        click.echo(f"  Domain override     : {domain}")
+ 
+    n = ingest_policy_pdf(
+        pdf_path,
+        settings,
+        department=department,
+        compliance_domain=domain,
+        batch_size=batch_size,
+    )
+ 
+    click.echo(f"\nDone – {n} chunks upserted into '{settings.qdrant_policies_collection}'.")
 
 
 @cli.command()
