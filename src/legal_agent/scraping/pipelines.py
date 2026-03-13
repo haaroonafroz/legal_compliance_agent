@@ -13,7 +13,7 @@ import torch
 from openai import OpenAI
 from transformers import AutoTokenizer
 from legal_agent.config import get_settings
-from legal_agent.workflow.prompts import _ENRICHMENT_FEW_SHOT
+from legal_agent.workflow.prompts import _ENRICHMENT_FEW_SHOT, _POLICY_ENRICHMENT_FEW_SHOT
 from legal_agent.scraping.items import ChunkedRegulationItem, RegulatoryDocumentItem
 from qdrant_client.models import PointStruct
 from legal_agent.utils.models import embed_texts, compute_vectors
@@ -23,7 +23,7 @@ from legal_agent.db.client import client_from_settings
 
 logger = logging.getLogger(__name__)
 
-
+_QDRANT_BATCH_SIZE = 32
 # ---------------------------------------------------------------------------
 # Pipeline 1 – Convert PDF to Markdown via Docling
 # ---------------------------------------------------------------------------
@@ -283,13 +283,48 @@ class ChunkingPipeline:
 # ---------------------------------------------------------------------------
 # Pipeline 3 – Metadata enrichment
 # ---------------------------------------------------------------------------
+_COLLECTION_REGULATION = "regulation"
+_COLLECTION_POLICY = "policy"
+ 
+ 
 class MetadataEnrichmentPipeline:
-    """Use a legal SLM or OpenAI to extract normalized metadata from each chunk."""
-    def __init__(self):
+    """Use a legal SLM or OpenAI to extract normalised metadata from each item.
+ 
+    The ``collection`` parameter selects which prompt and output schema to use:
+ 
+        collection="regulation"  (default — used by the Scrapy pipeline)
+            Prompt  : _ENRICHMENT_FEW_SHOT
+            Outputs : topic_tags, compliance_domain,
+                      applies_to_departments (list), obligation_type
+ 
+        collection="policy"  (used by loader.py for internal policy PDFs)
+            Prompt  : _POLICY_ENRICHMENT_FEW_SHOT
+            Outputs : topic_tags, compliance_domain,
+                      department (scalar string), obligation_type
+                      (policy_id is also returned by the LLM but intentionally
+                       ignored — it is not stored in the Qdrant payload)
+ 
+    Scrapy always instantiates pipelines via from_crawler(), which hard-codes
+    collection="regulation", so existing spider behaviour is 100% unchanged.
+    """
+ 
+    def __init__(self, collection: str = _COLLECTION_REGULATION) -> None:
+        if collection not in (_COLLECTION_REGULATION, _COLLECTION_POLICY):
+            raise ValueError(
+                f"collection must be {_COLLECTION_REGULATION!r} or "
+                f"{_COLLECTION_POLICY!r}, got {collection!r}"
+            )
+        self._collection = collection
         self._tokenizer = None
         self._model = None
         self._settings = None
-
+ 
+    @classmethod
+    def from_crawler(cls, crawler):
+        # Scrapy calls this instead of __init__ when ITEM_PIPELINES is used.
+        # Always "regulation" so the spider pipeline is unchanged.
+        return cls(collection=_COLLECTION_REGULATION)
+ 
     def open_spider(self, spider):
         self._settings = get_settings()
         if self._settings.use_legal_slm:
@@ -298,23 +333,47 @@ class MetadataEnrichmentPipeline:
                 self._settings.legal_slm_device,
                 self._settings.legal_slm_load_in_4bit,
             )
-
+ 
     def process_item(self, item, spider):
         if isinstance(item, RegulatoryDocumentItem):
             return self._enrich_document(item)
         return item
-
+ 
+    # ------------------------------------------------------------------
+    # Prompt + defaults selection
+    # ------------------------------------------------------------------
+ 
+    def _get_prompt(self) -> str:
+        if self._collection == _COLLECTION_POLICY:
+            return _POLICY_ENRICHMENT_FEW_SHOT
+        return _ENRICHMENT_FEW_SHOT
+ 
+    def _get_defaults(self) -> dict:
+        """Return safe fallback values matching the schema for this collection."""
+        if self._collection == _COLLECTION_POLICY:
+            return {
+                "topic_tags": [],
+                "compliance_domain": "",
+                "department": "General",    # scalar – matches _POLICY_ENRICHMENT_FEW_SHOT
+                "obligation_type": "",
+            }
+        return {
+            "topic_tags": [],
+            "compliance_domain": "",
+            "applies_to_departments": [],   # list – matches _ENRICHMENT_FEW_SHOT
+            "obligation_type": "",
+        }
+ 
+    # ------------------------------------------------------------------
+    # Document-level enrichment (called by process_item for Scrapy items)
+    # ------------------------------------------------------------------
+ 
     def _enrich_document(self, item: RegulatoryDocumentItem) -> RegulatoryDocumentItem:
         full_text = item.get("full_text", "")
         if not full_text:
             return item
         text = self._prepare_enrichment_text(full_text)
-        defaults = {
-            "topic_tags": [],
-            "compliance_domain": "",
-            "applies_to_departments": [],
-            "obligation_type": "",
-        }
+        defaults = self._get_defaults()
         try:
             if self._settings.use_legal_slm:
                 meta = self._extract_with_slm(text)
@@ -327,7 +386,11 @@ class MetadataEnrichmentPipeline:
             for key, val in defaults.items():
                 item[key] = val
         return item
-        
+ 
+    # ------------------------------------------------------------------
+    # Shared helpers
+    # ------------------------------------------------------------------
+ 
     @staticmethod
     def _prepare_enrichment_text(full_text: str, max_chars: int = 12000) -> str:
         full_text = full_text.strip()
@@ -338,9 +401,9 @@ class MetadataEnrichmentPipeline:
         middle = full_text[middle_start:middle_start + 4000]
         tail = full_text[-4000:]
         return f"{head}\n\n[...]\n\n{middle}\n\n[...]\n\n{tail}"
-
+ 
     def _extract_with_slm(self, text: str) -> dict:
-        prompt = _ENRICHMENT_FEW_SHOT.replace("{text}", text)
+        prompt = self._get_prompt().replace("{text}", text)
         inputs = self._tokenizer(prompt, return_tensors="pt").to(self._model.device)
         with torch.no_grad():
             outputs = self._model.generate(
@@ -355,14 +418,14 @@ class MetadataEnrichmentPipeline:
             outputs[0][inputs["input_ids"].shape[1]:], skip_special_tokens=True
         )
         return json.loads(generated.strip())
-
+ 
     def _extract_with_openai(self, text: str) -> dict:
         client = OpenAI(api_key=self._settings.openai_api_key)
         resp = client.chat.completions.create(
             model=self._settings.openai_llm_model_enrichment,
             messages=[
                 {"role": "system", "content": "You are a legal metadata tagger. Output JSON only."},
-                {"role": "user", "content": _ENRICHMENT_FEW_SHOT.replace("{text}", text)},
+                {"role": "user", "content": self._get_prompt().replace("{text}", text)},
             ],
             response_format={"type": "json_object"},
             temperature=0,
@@ -373,65 +436,106 @@ class MetadataEnrichmentPipeline:
 # Pipeline 4 – Upsert into Qdrant
 # ---------------------------------------------------------------------------
 class QdrantPipeline:
-    """Embed chunks and upsert them into the regulatory_updates Qdrant collection."""
+    """Embed chunks and upsert them into the regulatory_updates Qdrant collection.
+ 
+    Chunks are processed in batches of _QDRANT_BATCH_SIZE so that a 200-chunk
+    EDPB guideline PDF results in ~7 batched embedding calls rather than 200
+    sequential single-item calls.
+    """
 
     def __init__(self) -> None:
         self._client = None
-        self._embed_model = None
+        self._settings = None
         self._collection: str = ""
-
+        # Accumulation buffer: chunks are buffered here until a full batch is
+        # ready or the spider closes.
+        self._buffer: list[ChunkedRegulationItem] = []
+ 
     def open_spider(self, spider: Any) -> None:
         self._settings = get_settings()
         self._client = client_from_settings(self._settings)
         self._collection = self._settings.qdrant_regulatory_collection
-
+ 
     def process_item(self, item: Any, spider: Any) -> Any:
+        """Accept a single ChunkedRegulationItem or a list of them."""
+        incoming: list[ChunkedRegulationItem] = []
+ 
         if isinstance(item, list):
-            for chunk in item:
-                self._upsert_chunk(chunk)
+            incoming = [c for c in item if isinstance(c, ChunkedRegulationItem)]
         elif isinstance(item, ChunkedRegulationItem):
-            self._upsert_chunk(item)
+            incoming = [item]
+ 
+        if not incoming:
+            return item
+ 
+        self._buffer.extend(incoming)
+ 
+        # Flush complete batches immediately; keep remainder in buffer.
+        while len(self._buffer) >= _QDRANT_BATCH_SIZE:
+            batch = self._buffer[:_QDRANT_BATCH_SIZE]
+            self._buffer = self._buffer[_QDRANT_BATCH_SIZE:]
+            self._upsert_batch(batch)
+ 
         return item
-
-    def _upsert_chunk(self, chunk: ChunkedRegulationItem) -> None:
-        text = chunk["text"]
-        domain = chunk.get("compliance_domain", "")
-        tags = chunk.get("topic_tags", [])
-        embed_input = f"[{domain}] [{', '.join(tags)}] {text}"
-        named_vectors = compute_vectors(
-            [embed_input],
+ 
+    def close_spider(self, spider: Any) -> None:
+        """Flush any remaining buffered chunks when the spider finishes."""
+        if self._buffer:
+            self._upsert_batch(self._buffer)
+            self._buffer = []
+ 
+    def _upsert_batch(self, chunks: list[ChunkedRegulationItem]) -> None:
+        embed_inputs = [
+            f"[{c.get('compliance_domain', '')}] "
+            f"[{', '.join(c.get('topic_tags', []))}] "
+            f"{c['text']}"
+            for c in chunks
+        ]
+ 
+        named_vectors_list = compute_vectors(
+            embed_inputs,
             self._settings,
             dense_name=self._settings.qdrant_regulatory_dense_name,
             sparse_name=self._settings.qdrant_sparse_name,
-        )[0]
-        point_id = hashlib.sha256(chunk["chunk_id"].encode("utf-8")).hexdigest()[:32]
-        point_id_int = int(point_id, 16) % (2**63)
-        self._client.upsert(
-            collection_name=self._collection,
-            points=[
-                PointStruct(
-                    id=point_id_int,
-                    vector=named_vectors,
-                    payload={
-                        "text": text,
-                        "header_path": chunk["header_path"],
-                        "source_url": chunk["source_url"],
-                        "jurisdiction": chunk["jurisdiction"],
-                        "effective_date": chunk["effective_date"],
-                        "is_processed": False,
-                        "document_id": chunk["document_id"],
-                        "document_hash": chunk["document_hash"],
-                        "chunk_id": chunk["chunk_id"],
-                        "prev_chunk_id": chunk["prev_chunk_id"],
-                        "next_chunk_id": chunk["next_chunk_id"],
-                        "chunk_index": chunk["chunk_index"],
-                        "chunk_count": chunk["chunk_count"],
-                        "token_count": chunk["token_count"],
-                        "topic_tags": chunk.get("topic_tags", []),
-                        "compliance_domain": chunk.get("compliance_domain", ""),
-                        "applies_to_departments": chunk.get("applies_to_departments", []),
-                        "obligation_type": chunk.get("obligation_type", ""),
-                    },
-                )
-            ],
+        )
+ 
+        points = [
+            self._build_point(chunk, named_vectors)
+            for chunk, named_vectors in zip(chunks, named_vectors_list)
+        ]
+ 
+        self._client.upsert(collection_name=self._collection, points=points)
+        logger.info("Upserted batch of %d regulatory chunks.", len(points))
+ 
+    @staticmethod
+    def _build_point(
+        chunk: ChunkedRegulationItem, named_vectors: Any
+    ) -> PointStruct:
+        point_id = int(
+            hashlib.sha256(chunk["chunk_id"].encode("utf-8")).hexdigest()[:32], 16
+        ) % (2**63)
+ 
+        return PointStruct(
+            id=point_id,
+            vector=named_vectors,
+            payload={
+                "text": chunk["text"],
+                "header_path": chunk["header_path"],
+                "source_url": chunk["source_url"],
+                "jurisdiction": chunk["jurisdiction"],
+                "effective_date": chunk["effective_date"],
+                "is_processed": False,
+                "document_id": chunk["document_id"],
+                "document_hash": chunk["document_hash"],
+                "chunk_id": chunk["chunk_id"],
+                "prev_chunk_id": chunk["prev_chunk_id"],
+                "next_chunk_id": chunk["next_chunk_id"],
+                "chunk_index": chunk["chunk_index"],
+                "chunk_count": chunk["chunk_count"],
+                "token_count": chunk["token_count"],
+                "topic_tags": chunk.get("topic_tags", []),
+                "compliance_domain": chunk.get("compliance_domain", ""),
+                "applies_to_departments": chunk.get("applies_to_departments", []),
+                "obligation_type": chunk.get("obligation_type", ""),
+            },
         )
