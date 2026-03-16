@@ -57,7 +57,7 @@ def _init_phoenix(settings: "Settings") -> None:
         from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 
         # Launch local Phoenix server if using localhost endpoint
-        if "localhost" in settings.phoenix_endpoint:
+        if "localhost" in settings.phoenix_endpoint and not settings.phoenix_external:
             px.launch_app()
 
         # Add Phoenix as a second OTel exporter so spans go to BOTH

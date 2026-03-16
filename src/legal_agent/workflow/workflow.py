@@ -298,7 +298,7 @@ class ComplianceWorkflow(Workflow):
                     audit_notes=ev.audit_notes,
                     passed=ev.passed,
                 )
-            logger.warning("Audit FAILED (retry %d) – sending back to Analyst.", retries + 1)
+            logger.warning("Audit FAILED (retry %d) – sending back to the Redliner.", retries + 1)
             await ctx.store.set("audit_retries", retries + 1)
             return AnalysisCompleteEvent(
                 regulation=ev.regulation,

@@ -45,6 +45,7 @@ class Settings(BaseSettings):
 
     # Arize Phoenix
     phoenix_endpoint: str = os.getenv("PHOENIX_ENDPOINT")
+    phoenix_external: bool = os.getenv("PHOENIX_EXTERNAL", True)
 
     # LangWatch
     langwatch_api_key: str = os.getenv("LANGWATCH_API_KEY")
