@@ -1,13 +1,28 @@
 [
   {
-    "name": "European Data Protection Board – Guidelines",
+    "name": "EDPB - Compliance Monitoring",
     "jurisdiction": "EU",
-    "start_urls": ["https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/guidelines_en"],
+    "start_urls": [
+      "https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/guidelines_en",
+      "https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/recommendations_en",
+      "https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/opinions_en"
+    ],
     "allowed_domains": ["edpb.europa.eu"],
+    "allow_patterns": [
+      "/our-work-tools/documents/public-consultations/",
+      "/our-work-tools/our-documents/",
+      "/[\\w-]+/[\\w-]+/[\\d]{4}/[\\w-]+" 
+    ],
+    "deny_patterns": [
+      "/about-edpb/",
+      "/careers/",
+      "/contact/",
+      "/news/"
+    ],
     "follow_links": true,
     "follow_pdf": true,
-    "max_depth": 2,
-    "max_pages": 30,
-    "max_pdfs": 10
+    "max_depth": 3,
+    "max_pages": 50,
+    "max_pdfs": 15
   }
 ]

@@ -138,6 +138,7 @@ class _JobState:
         "max_depth", "max_pages", "max_pdfs",
         "pages_seen", "pdfs_seen",
         "html_requests_pending", "pdf_requests_pending",
+        "allow_patterns", "deny_patterns",
     )
 
     def __init__(
@@ -150,6 +151,8 @@ class _JobState:
         max_depth: int,
         max_pages: int,
         max_pdfs: int,
+        allow_patterns: list[str] = None,
+        deny_patterns: list[str] = None,
     ) -> None:
         self.jurisdiction = jurisdiction
         # Strip leading wildcard so "*.europa.eu" → "europa.eu"
@@ -159,6 +162,8 @@ class _JobState:
         self.max_depth = max_depth   # 0 = unlimited
         self.max_pages = max_pages   # 0 = unlimited
         self.max_pdfs = max_pdfs     # 0 = unlimited
+        self.allow_patterns = allow_patterns
+        self.deny_patterns = deny_patterns
         self.pages_seen = 0
         self.pdfs_seen = 0
         self.html_requests_pending = 0
@@ -196,6 +201,32 @@ class _JobState:
 
     def claim_pdf(self) -> None:
         self.pdfs_seen += 1
+    
+    def url_allowed(self, url: str) -> bool:
+        """True if URL passes allow_patterns and deny_patterns."""
+        from urllib.parse import urlparse
+        import re
+
+        path = urlparse(url).path or "/"
+        # Deny wins: if any deny pattern matches, reject
+        for pat in self.deny_patterns:
+            try:
+                if re.search(pat, path):
+                    return False
+            except re.error:
+                if pat in path:
+                    return False
+        # Allow: if we have allow patterns, at least one must match
+        if self.allow_patterns:
+            for pat in self.allow_patterns:
+                try:
+                    if re.search(pat, path):
+                        return True
+                except re.error:
+                    if pat in path:
+                        return True
+            return False
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +289,7 @@ class RegulatorySpider(scrapy.Spider):
         self.sources_file = sources_file
         # job_key (= start_url) → _JobState
         self._jobs: dict[str, _JobState] = {}
+        
 
     # ------------------------------------------------------------------
     # Request generation
@@ -279,6 +311,8 @@ class RegulatorySpider(scrapy.Spider):
             max_depth: int = int(target.get("max_depth", 2))
             max_pages: int = int(target.get("max_pages", 0))
             max_pdfs: int = int(target.get("max_pdfs", 0))
+            allow_patterns: list[str] = target.get("allow_patterns", [])
+            deny_patterns: list[str] = target.get("deny_patterns", [])
 
             for url in target["start_urls"]:
                 # Use the start URL as the job key so each entry point gets
@@ -287,6 +321,8 @@ class RegulatorySpider(scrapy.Spider):
                 self._jobs[job_key] = _JobState(
                     jurisdiction=jurisdiction,
                     allowed_domains=allowed_domains,
+                    allow_patterns=allow_patterns,
+                    deny_patterns=deny_patterns,
                     follow_links=follow_links,
                     follow_pdf=follow_pdf,
                     max_depth=max_depth,
@@ -316,7 +352,6 @@ class RegulatorySpider(scrapy.Spider):
     # ------------------------------------------------------------------
     # Main dispatcher
     # ------------------------------------------------------------------
-
     def parse(self, response: Response) -> Iterator[RegulatoryDocumentItem | scrapy.Request]:
         """Route each response to the PDF or HTML handler."""
         job_key: str = response.meta["job_key"]
@@ -350,11 +385,12 @@ class RegulatorySpider(scrapy.Spider):
         response: Response,
         job: _JobState,
     ) -> Iterator[RegulatoryDocumentItem]:
-        if not job.pdf_slot_available():
-            logger.info("PDF quota reached – stopping PDF link collection.")
-            break
-        job.pdf_requests_pending += 1
-        yield scrapy.Request(...)
+        if not job.pdf_allowed():
+            logger.info(
+                "PDF quota (%d) reached – skipping %s",
+                job.max_pdfs, response.url,
+            )
+            return
 
         job.claim_pdf()
         logger.info(
@@ -370,7 +406,6 @@ class RegulatorySpider(scrapy.Spider):
             is_pdf=True,
             raw_pdf_bytes=response.body,
         )
-
     # ------------------------------------------------------------------
     # HTML handler
     # ------------------------------------------------------------------
@@ -402,12 +437,12 @@ class RegulatorySpider(scrapy.Spider):
         job_key: str = response.meta["job_key"]
 
         # -- page quota -------------------------------------------------
-        if not job.html_slot_available():
-            logger.info("Page quota (%d) reached – stopping HTML link collection.", job.max_pages)
-            break
-        job.html_requests_pending += 1
-        yield scrapy.Request(...)
-
+        if not job.page_allowed():
+            logger.info(
+                "Page quota (%d) reached – skipping %s",
+                job.max_pages, response.url,
+            )
+            return
         job.claim_page()
         logger.info(
             "[page %d/%s  depth %d/%s] %s",
@@ -481,9 +516,12 @@ class RegulatorySpider(scrapy.Spider):
                 abs_url = response.urljoin(href)
                 if not job.domain_allowed(abs_url):
                     continue
-                if not job.pdf_allowed():
+                if not job.url_allowed(abs_url):
+                    continue
+                if not job.pdf_slot_available():
                     logger.info("PDF quota reached – stopping PDF link collection.")
                     break
+                job.pdf_requests_pending += 1
                 yield scrapy.Request(
                     abs_url,
                     callback=self.parse,
@@ -506,9 +544,12 @@ class RegulatorySpider(scrapy.Spider):
                     continue  # skip anchors, mailto, javascript:, etc.
                 if not job.domain_allowed(abs_url):
                     continue
-                if not job.page_allowed():
+                if not job.url_allowed(abs_url):
+                    continue
+                if not job.html_slot_available():
                     logger.info("Page quota reached – stopping HTML link collection.")
                     break
+                job.html_requests_pending += 1
                 yield scrapy.Request(
                     abs_url,
                     callback=self.parse,
