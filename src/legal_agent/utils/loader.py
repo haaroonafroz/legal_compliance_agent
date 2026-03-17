@@ -145,6 +145,10 @@ def ingest_policy_pdf(
             settings.legal_slm_device,
             settings.legal_slm_load_in_4bit,
         )
+    elif settings.use_gemini:
+        meta = enrichment_pipeline._extract_with_gemini(enrichment_input)
+    else:
+        meta = enrichment_pipeline._extract_with_openai(enrichment_input)
 
     # Fetch the policy-schema defaults (department scalar, no applies_to_departments).
     defaults = enrichment_pipeline._get_defaults()

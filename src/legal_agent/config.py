@@ -14,6 +14,15 @@ class Settings(BaseSettings):
     openai_embedding_model: str = os.getenv("OPENAI_EMBEDDING_MODEL")
     openai_embedding_dim: int = 768
 
+    # Gemini
+    use_gemini: bool = os.getenv("USE_GEMINI", False)
+    gemini_api_key: str = os.getenv("GEMINI_API_KEY")
+    gemini_model: str = os.getenv("GEMINI_MODEL")
+    analyst_thinking: str = "medium"
+    redliner_thinking: str = "medium"
+    auditor_thinking: str = "high"
+    enrichment_thinking: str = "low"
+
     # Qdrant
     qdrant_url: str = os.getenv("QDRANT_URL")
     qdrant_api_key: str = os.getenv("QDRANT_API_KEY")

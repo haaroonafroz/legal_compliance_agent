@@ -377,6 +377,8 @@ class MetadataEnrichmentPipeline:
         try:
             if self._settings.use_legal_slm:
                 meta = self._extract_with_slm(text)
+            elif self._settings.use_gemini:
+                meta = self._extract_with_gemini(text)
             else:
                 meta = self._extract_with_openai(text)
             for key in defaults:
@@ -431,6 +433,22 @@ class MetadataEnrichmentPipeline:
             temperature=0,
         )
         return json.loads(resp.choices[0].message.content)
+
+    def _extract_with_gemini(self, text: str) -> dict:
+        from google import genai
+        from google.genai import types
+        client = genai.Client(api_key=self._settings.gemini_api_key)
+        thinking_level = self._settings.enrichment_thinking
+        resp = client.models.generate_content(
+            model=self._settings.gemini_model,
+            contents=self._get_prompt().replace("{text}", text),
+            config=types.GenerateContentConfig(
+                system_instruction="You are a legal metadata tagger. Output JSON only.",
+                thinking_config=types.ThinkingConfig(thinking_level=thinking_level),
+                temperature=0, response_mime_type="application/json",
+            ),
+        )
+        return json.loads(resp.text)
 
 # ---------------------------------------------------------------------------
 # Pipeline 4 – Upsert into Qdrant

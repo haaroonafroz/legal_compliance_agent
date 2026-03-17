@@ -14,6 +14,7 @@ from llama_index.core.workflow import (
 )
 from llama_index.llms.openai import OpenAI as LlamaOpenAI
 from llama_index.core.base.llms.types import ChatMessage, MessageRole
+from legal_agent.workflow.llm_provider import get_llm_for_step
 
 from legal_agent.config import Settings
 from legal_agent.db.client import client_from_settings
@@ -52,11 +53,11 @@ class ComplianceWorkflow(Workflow):
     def __init__(self, settings: Settings, **kwargs: Any) -> None:
         super().__init__(**kwargs)
         self.settings = settings
-        self.llm = LlamaOpenAI(model=settings.openai_llm_model, api_key=settings.openai_api_key)
+        self.llm_analyst = get_llm_for_step(settings, "analyst")
+        self.llm_redliner = get_llm_for_step(settings, "redliner")
+        self.llm_auditor = get_llm_for_step(settings, "auditor")
         self.qdrant = client_from_settings(settings)
-
         from openai import OpenAI
-
         self._openai = OpenAI(api_key=settings.openai_api_key)
 
     # ------------------------------------------------------------------
@@ -242,7 +243,7 @@ class ComplianceWorkflow(Workflow):
             policies_text=policies_text[:6000],
         )
 
-        response = await self.llm.achat(messages=_chat_messages(ANALYST_SYSTEM, prompt))
+        response = await self.llm_analyst.achat(messages=_chat_messages(ANALYST_SYSTEM, prompt))
 
         return AnalysisCompleteEvent(
             regulation=ev.regulation,
@@ -270,7 +271,7 @@ class ComplianceWorkflow(Workflow):
             gap_analysis=ev.gap_analysis[:8000],
             audit_feedback=audit_feedback,
         )
-        response = await self.llm.achat(messages=_chat_messages(REDLINER_SYSTEM, prompt))
+        response = await self.llm_redliner.achat(messages=_chat_messages(REDLINER_SYSTEM, prompt))
 
         return DraftCompleteEvent(
             regulation=ev.regulation,
@@ -314,7 +315,7 @@ class ComplianceWorkflow(Workflow):
             proposed_updates=ev.proposed_updates[:6000],
         )
 
-        response = await self.llm.achat(messages=_chat_messages(AUDITOR_SYSTEM, prompt))
+        response = await self.llm_auditor.achat(messages=_chat_messages(AUDITOR_SYSTEM, prompt))
 
         passed = response.message.content.strip().upper().startswith("PASS")
 
