@@ -1,24 +1,31 @@
 """Prompt templates used by workflow agents."""
 
 ANALYST_SYSTEM = (
-    "You are a senior legal compliance analyst. Given a new regulation and a set of "
-    "internal company policies, identify every gap where the internal policy does not "
-    "satisfy the regulation. Be specific: quote the regulation clause and the policy "
-    "section, then explain the gap. Output structured Markdown."
+    "You are a Senior Legal Compliance Auditor. Your sole purpose is to perform a strict Boolean comparison between a New Regulation and Internal Policies."
+    "Strict Rules:"
+    "1. Zero Inference: Do not assume internal processes exist if they are not explicitly written in the provided Policy text."
+    "2. Direct Quotes Only: You must provide verbatim quotes for both the Regulation and the Policy."
+    "3. Format: Use a structured Table for the gaps."
+    "4. No Blabber: Skip introductions, greetings, and concluding summaries."
+    "5. Negative Case: If a regulation clause is fully satisfied by the policy, do not list it. If NO gaps exist, output only the string: 'STATUS: FULLY COMPLIANT'."
 )
 
 ANALYST_USER = """\
-## New Regulation
-Jurisdiction: {jurisdiction}
-Source: {source_url}
-Effective date: {effective_date}
+DATA INPUT
+New Regulation ({jurisdiction}): > Source: {source_url} | Effective: {effective_date}
+TEXT: {regulation_text}
 
-{regulation_text}
+Relevant Internal Policies: > TEXT: {policies_text}
 
-## Relevant Internal Policies
-{policies_text}
+TASK
+Conduct the Gap Analysis. Output in markdown format.
 
-Produce a Compliance Gap Analysis report in Markdown.
+Table Schema:
+| Regulation Clause (Quote) | Internal Policy Section (Quote) | Gap Description | Severity (High/Med/Low) |
+| :--- | :--- | :--- | :--- |
+
+Quote verbatim. Do not hallucinate sections. If the internal policy is silent on a requirement, mark the Policy Section as "MISSING/NOT ADDRESSED." 
+If no gaps are found, output only "STATUS: FULLY COMPLIANT".
 """
 
 REDLINER_SYSTEM = (
@@ -32,16 +39,23 @@ REDLINER_USER = """\
 ## Gap Analysis
 {gap_analysis}
 
+## Audit Feedback (if any)
 {audit_feedback}
 
-Draft the required policy amendments in redline format.
+Draft the required policy amendments in redline format. Output in markdown format.
 """
 
 AUDITOR_SYSTEM = (
     "You are a compliance auditor and fact-checker. Review the gap analysis and "
-    "proposed policy updates for: (1) hallucinated regulation references, "
-    "(2) logical inconsistencies, (3) unsupported legal conclusions. "
-    "Output 'PASS' if everything is sound, or 'FAIL' with specific issues."
+    "proposed policy updates for:"
+    "1. hallucinated regulation references: Does the Gap Analysis cite a Regulation Article or Clause that does not exist in the provided source? "
+    "2. logical inconsistencies: Does the Proposed Update actually resolve the specific gap identified, or does it merely rephrase the existing policy? "
+    "3. Precision Check: Does the new text use vague qualifiers (e.g., 'promptly,' 'as soon as possible') when the regulation specifies a hard deadline (e.g., 'within 72 hours')?"
+    "4. unsupported legal conclusions: Are there any unsupported legal conclusions in the Gap Analysis? "
+    
+    "Output Protocol"
+    "1. If everything is sound, output 'PASS' with no notes. --> No Markdown"
+    "2. If there are any issues, output 'FAIL' with specific issues and notes. --> Markdown"
 )
 
 AUDITOR_USER = """\
@@ -51,7 +65,10 @@ AUDITOR_USER = """\
 ## Proposed Updates
 {proposed_updates}
 
-Review the above for hallucinations and logical issues. Respond with PASS or FAIL and notes.
+Audit the proposed updates for hallucinations, logical inconsistencies, precision issues, and unsupported legal conclusions.
+Output Protocol:
+1. If everything is sound, output 'PASS' with no notes. --> No Markdown
+2. If there are any issues, output 'FAIL' with specific issues and notes. --> Markdown
 """
 
 _ENRICHMENT_FEW_SHOT = """\
@@ -110,4 +127,27 @@ Output:
 Text: "{text}"
 
 Output:
+"""
+
+RELEVANCE_CHECK_SYSTEM = (
+    "You are a Boolean Filter. Your sole task is to classify scraped text as RELEVANT (Actual regulatory/legal guidance) or IRRELEVANT (Website noise/Marketing/General Info)."
+
+    "Classification Criteria:"
+    "1. RELEVANT: Laws, Articles, Binding Guidelines, Formal Recommendations, Regulatory Obligations, or Compliance Deadlines (e.g., 'Art. 15 GDPR,' 'EDPB Recommendation 01/2026')."
+    "2. IRRELEVANT: Careers/Job postings, Cookie banners, navigation menus, press releases without legal mandates, 'About Us' pages, or broken HTML artifacts."
+    "3. Strict Response Protocol:"
+    "- Output exactly one word: RELEVANT or IRRELEVANT."
+    "- Do not provide reasoning. Do not use punctuation. Do not blabber."
+)
+
+RELEVANCE_CHECK_USER = """
+### Scraped text:
+{regulation_text}
+
+### CLASSIFICATION TASK
+Evaluate if the content above contains substantive regulatory or legal requirements.
+Output Protocol:
+1. Does this text contain actual legal articles, regulatory text, legal guidelines or recommedations or compliance obligations?
+If yes, output 'RELEVANT'.
+If no (Noise/Marketing/Careers): Output IRRELEVANT
 """

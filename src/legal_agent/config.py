@@ -9,19 +9,22 @@ class Settings(BaseSettings):
 
     # OpenAI
     openai_api_key: str = os.getenv("OPENAI_API_KEY")
-    openai_llm_model: str = os.getenv("OPENAI_LLM_MODEL")
-    openai_llm_model_enrichment: str = os.getenv("OPENAI_LLM_MODEL_ENRICHMENT")
+    openai_llm_model: str = os.getenv("OPENAI_LLM_MODEL", "gpt-4o")
+    openai_llm_model_enrichment: str = os.getenv("OPENAI_LLM_MODEL_ENRICHMENT", "gpt-4o-mini")
+    openai_llm_model_relevance_check: str = os.getenv("OPENAI_LLM_MODEL_RELEVANCE_CHECK", "gpt-4o-mini")
     openai_embedding_model: str = os.getenv("OPENAI_EMBEDDING_MODEL")
     openai_embedding_dim: int = 768
 
     # Gemini
     use_gemini: bool = os.getenv("USE_GEMINI", False)
+    use_gemini_enrichment: bool = os.getenv("USE_GEMINI_ENRICHMENT", False)
     gemini_api_key: str = os.getenv("GEMINI_API_KEY")
     gemini_model: str = os.getenv("GEMINI_MODEL")
     analyst_thinking: str = "medium"
     redliner_thinking: str = "medium"
     auditor_thinking: str = "high"
     enrichment_thinking: str = "low"
+    relevance_check_thinking: str = "minimal"
 
     # Qdrant
     qdrant_url: str = os.getenv("QDRANT_URL")

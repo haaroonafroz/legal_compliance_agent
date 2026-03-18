@@ -25,6 +25,7 @@ from legal_agent.workflow.events import (
     FinalReportEvent,
     NewLawEvent,
     RetrievedContextEvent,
+    RelevantContextEvent,
 )
 from legal_agent.workflow.prompts import (
     ANALYST_SYSTEM,
@@ -33,6 +34,8 @@ from legal_agent.workflow.prompts import (
     AUDITOR_USER,
     REDLINER_SYSTEM,
     REDLINER_USER,
+    RELEVANCE_CHECK_SYSTEM,
+    RELEVANCE_CHECK_USER,
 )
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,7 @@ class ComplianceWorkflow(Workflow):
         self.llm_analyst = get_llm_for_step(settings, "analyst")
         self.llm_redliner = get_llm_for_step(settings, "redliner")
         self.llm_auditor = get_llm_for_step(settings, "auditor")
+        self.llm_relevance_check = get_llm_for_step(settings, "relevance_check")
         self.qdrant = client_from_settings(settings)
         from openai import OpenAI
         self._openai = OpenAI(api_key=settings.openai_api_key)
@@ -74,7 +78,7 @@ class ComplianceWorkflow(Workflow):
             scroll_filter=Filter(
                 must=[FieldCondition(key="is_processed", match=MatchValue(value=False))]
             ),
-            limit=100,
+            limit=1000,
             with_payload=True,
             with_vectors=False,
         )
@@ -186,7 +190,7 @@ class ComplianceWorkflow(Workflow):
                 Prefetch(
                     query=dense_vector,
                     using=self.settings.qdrant_policies_dense_name,
-                    limit=20,
+                    limit=30,
                     filter=query_filter,
                 )
             )
@@ -194,7 +198,7 @@ class ComplianceWorkflow(Workflow):
                 Prefetch(
                     query=SparseVector(indices=indices, values=values),
                     using=self.settings.qdrant_sparse_name,
-                    limit=20,
+                    limit=30,
                     filter=query_filter,
                 )
             )
@@ -202,7 +206,7 @@ class ComplianceWorkflow(Workflow):
             collection_name=self.settings.qdrant_policies_collection,
             prefetch=prefetches,
             query=FusionQuery(fusion="rrf"),
-            limit=10,
+            limit=20,
             with_payload=True,
         )
 
@@ -221,12 +225,66 @@ class ComplianceWorkflow(Workflow):
             matched_policies=matched_policies,
             retrieval_scores=scores,
         )
+    # ------------------------------------------------------------------
+    # Step Intermediate – Relevance check
+    # ------------------------------------------------------------------
+    @step
+    async def relevance_check(
+        self, ctx: Context, ev: RetrievedContextEvent
+    ) -> RelevantContextEvent | StopEvent:
+        """Determine if the regulation is relevant or noise."""
+        
+        logger.info(
+            "Relevance check: checking '%s'…",
+            ev.regulation.source_url,
+        )
+        prompt = RELEVANCE_CHECK_USER.format(
+            regulation_text=ev.regulation.regulation_text,
+        )
+        response = await self.llm_relevance_check.achat(
+            messages=_chat_messages(RELEVANCE_CHECK_SYSTEM, prompt)
+        )
+        decision = response.message.content.strip().upper()
 
+        if decision.startswith("IRRELEVANT"):
+            logger.info("Document marked as IRRELEVANT. Stopping workflow and starting again.")
+
+            from qdrant_client.models import FieldCondition, Filter, MatchValue
+            # ✅ mark as processed
+            self.qdrant.set_payload(
+                collection_name=self.settings.qdrant_regulatory_collection,
+                payload={"is_processed": True},
+                points=Filter(
+                    must=[
+                        FieldCondition(
+                            key="document_id",
+                            match=MatchValue(value=ev.regulation.document_id),
+                        )
+                    ]
+                ),
+            )
+            # ✅ stop workflow early
+            return StopEvent(
+                result={
+                    "document_id": ev.regulation.document_id,
+                    "skipped": True,
+                    "reason": "irrelevant",
+                }
+            )
+        # -----------------------------
+        # ✅ RELEVANT → CONTINUE FLOW
+        # -----------------------------
+        logger.info("Document is RELEVANT. Continuing workflow.")
+        return RelevantContextEvent(
+            regulation=ev.regulation,
+            matched_policies=ev.matched_policies,
+            retrieval_scores=ev.retrieval_scores,
+        )
     # ------------------------------------------------------------------
     # Step 3 – Analyst (gap analysis)
     # ------------------------------------------------------------------
     @step
-    async def analyst(self, ctx: Context, ev: RetrievedContextEvent) -> AnalysisCompleteEvent:
+    async def analyst(self, ctx: Context, ev: RelevantContextEvent) -> AnalysisCompleteEvent:
         """Compare regulation against internal policies and produce gap analysis."""
         logger.info("Analyst: generating gap analysis for '%s'…", ev.regulation.source_url)
 

@@ -32,6 +32,11 @@ class RetrievedContextEvent(Event):
     matched_policies: list[dict]
     retrieval_scores: list[float] = Field(default_factory=list)
 
+class RelevantContextEvent(Event):
+    """Emitted by relevance_check when the document is relevant. Analyst subscribes to this."""
+    regulation: NewLawEvent  # or reuse the regulation fields
+    matched_policies: list[dict]
+    retrieval_scores: list[float]
 
 class AnalysisCompleteEvent(Event):
     """Emitted by the Analyst with the gap analysis between regulation and policies."""

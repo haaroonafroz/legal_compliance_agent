@@ -19,6 +19,7 @@ def get_llm_for_step(settings: Settings, step_name: str) -> LLM:
             "redliner": settings.redliner_thinking,
             "auditor": settings.auditor_thinking,
             "enrichment": settings.enrichment_thinking,
+            "relevance_check": settings.relevance_check_thinking,
         }
         thinking_level = level_map.get(step_name, "medium")
 
@@ -31,7 +32,18 @@ def get_llm_for_step(settings: Settings, step_name: str) -> LLM:
         )
     else:
         from llama_index.llms.openai import OpenAI as LlamaOpenAI
-        return LlamaOpenAI(
-            model=settings.openai_llm_model,
-            api_key=settings.openai_api_key,
+        if step_name == "relevance_check":
+            return LlamaOpenAI(
+                model=settings.openai_llm_model_relevance_check,
+                api_key=settings.openai_api_key,
+            )
+        elif step_name == "enrichment":
+            return LlamaOpenAI(
+                model=settings.openai_llm_model_enrichment,
+                api_key=settings.openai_api_key,
+            )
+        else:
+            return LlamaOpenAI(
+                model=settings.openai_llm_model,
+                api_key=settings.openai_api_key,
         )

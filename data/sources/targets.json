@@ -8,16 +8,13 @@
       "https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/opinions_en"
     ],
     "allowed_domains": ["edpb.europa.eu"],
-    "allow_patterns": [
-      "/our-work-tools/documents/public-consultations/",
-      "/our-work-tools/our-documents/",
-      "/[\\w-]+/[\\w-]+/[\\d]{4}/[\\w-]+" 
-    ],
     "deny_patterns": [
       "/about-edpb/",
       "/careers/",
       "/contact/",
-      "/news/"
+      "/news/",
+      "/accountability-tools_en",
+      "/newsfeed/"
     ],
     "follow_links": true,
     "follow_pdf": true,

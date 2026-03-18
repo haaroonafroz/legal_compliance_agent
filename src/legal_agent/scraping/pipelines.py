@@ -377,7 +377,7 @@ class MetadataEnrichmentPipeline:
         try:
             if self._settings.use_legal_slm:
                 meta = self._extract_with_slm(text)
-            elif self._settings.use_gemini:
+            elif self._settings.use_gemini_enrichment:
                 meta = self._extract_with_gemini(text)
             else:
                 meta = self._extract_with_openai(text)
