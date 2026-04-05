@@ -70,6 +70,10 @@ class Settings(BaseSettings):
     chunk_overlap_tokens: int = 64
     chunking_tokenizer_model: str = "nlpaueb/legal-bert-base-uncased"
 
+    # Reranker layer
+    voyage_api_key: str = os.getenv("VOYAGE_API_KEY")
+    voyage_model: str = "rerank-2.5"
+
 
 def get_settings() -> Settings:
     return Settings()

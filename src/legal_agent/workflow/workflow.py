@@ -216,6 +216,41 @@ class ComplianceWorkflow(Workflow):
             matched_policies.append(hit.payload)
             scores.append(hit.score)
         
+        query_parts = []
+        if ev.compliance_domain:
+            query_parts.append(f"[{ev.compliance_domain}]")
+        if ev.topic_tags:
+            query_parts.append(f"[{', '.join(ev.topic_tags)}]")
+        query_parts.append(ev.regulation_text[:12000])  # truncate to stay within token limits
+        rerank_query = " ".join(query_parts)
+
+        documents = []
+        for p in matched_policies:
+            text = p.get("text", "")
+            header = p.get("header_path", "")
+            doc = f"[Section: {header}]\n\n{text}" if header else text
+            documents.append(doc)
+        
+        import voyageai
+        if self.settings.voyage_api_key and len(matched_policies) > 10:
+            vo = voyageai.Client(api_key=self.settings.voyage_api_key)
+            reranking = vo.rerank(
+                query=rerank_query,
+                documents=documents,
+                model=self.settings.voyage_model,  # "rerank-2.5"
+                top_k=5,
+                truncation=True,
+            )
+            # Reorder by rerank results (results are sorted by relevance, descending)
+            indices = [r.index for r in reranking.results]
+            matched_policies = [matched_policies[i] for i in indices]
+            scores = [scores[i] for i in indices]
+        elif len(matched_policies) > 10:
+            # No reranker: take top 10 by original RRF score
+            matched_policies = matched_policies[:5]
+            scores = scores[:5]
+
+        
         await ctx.store.set("matched_policies", matched_policies)
         await ctx.store.set("retrieval_scores", scores)
 

@@ -24,7 +24,7 @@ Table Schema:
 | Regulation Clause (Quote) | Internal Policy Section (Quote) | Gap Description | Severity (High/Med/Low) |
 | :--- | :--- | :--- | :--- |
 
-Quote verbatim. Do not hallucinate sections. If the internal policy is silent on a requirement, mark the Policy Section as "MISSING/NOT ADDRESSED." 
+Regulation clause and the internal policy section must be quoted verbatim. Do not hallucinate sections. If the internal policy is silent on a requirement, mark the Policy Section as "MISSING/NOT ADDRESSED." 
 If no gaps are found, output only "STATUS: FULLY COMPLIANT".
 """
 
