@@ -1,39 +1,32 @@
 # Legal Agent
 
-`legal-agent` is a regulatory intelligence pipeline for compliance teams. It scrapes regulatory sources, stages the resulting documents in Qdrant, retrieves the most relevant internal policy chunks, and runs an event-driven workflow that produces:
+A tool to help legal teams track new laws and update company rules.
 
-- a gap analysis between external regulation and internal policy
-- proposed policy amendments in redline format
-- an auditor verdict and a saved report artifact
+The agent finds new rules online. It checks them against your company rules. Then, it tells you what needs to change.
 
-The project was built around one core requirement from the original project plan: make the workflow inspectable and easy to evaluate. The architecture therefore favors explicit workflow steps, stored intermediate artifacts, and trace-friendly integrations over opaque agent loops.
+## How It Works
 
-## Overview
+The agent runs in five clear steps:
 
-The pipeline has two main phases:
+1. **Scrape:** It finds new laws on the web.
+2. **Retrieve:** It finds your company rules that match the new law.
+3. **Analyze:** It spots the gaps between the law and your rules.
+4. **Draft:** It writes text to fix your rules.
+5. **Audit:** It checks its own work for mistakes.
 
-1. **Harvest and stage regulations**
-   Scrapy crawls sites defined in `data/sources/targets.json`, extracts HTML or PDF content, converts PDFs to Markdown with Docling, chunks the text, enriches it with metadata, and stores it in the `regulatory_updates` Qdrant collection.
-2. **Run compliance analysis**
-   A `LlamaIndex` workflow picks up unprocessed regulations, retrieves relevant policy chunks from `internal_policies`, performs gap analysis, drafts policy updates, audits the draft, and writes a report to `data/reports/`.
+## Tools in Use
 
-Current workflow steps:
+We use a few key tools to build this agent:
 
-1. `Horizon Scanner`: groups unprocessed regulation chunks back into complete documents.
-2. `Librarian`: runs hybrid retrieval against internal policies.
-3. `Relevance Check`: filters out site noise and non-regulatory content.
-4. `Analyst`: compares regulation text against internal policy text.
-5. `Redliner`: drafts policy amendments in redline form.
-6. `Auditor`: checks for hallucinations, weak reasoning, and draft mismatch before finalizing.
+* **Scrapy:** Crawls websites to find new legal texts.
+* **Docling:** Turns PDF files into plain text.
+* **Qdrant:** A smart database. It stores and finds the right text chunks fast.
+* **LlamaIndex:** Runs the step-by-step agent logic.
+* **Langfuse & Phoenix:** Tracks costs and AI choices so you can test the agent.
 
 ## Quick Start
 
-### Requirements
-
-- Python 3.11+
-- Access to a Qdrant instance
-- OpenAI API key for the default setup
-- Optional: Gemini, VoyageAI, Langfuse, Phoenix, and LangWatch
+Here is how to run the agent on your machine.
 
 ### 1. Install
 
@@ -41,227 +34,61 @@ Current workflow steps:
 pip install -e ".[dev]"
 ```
 
-### 2. Configure environment
+### 2. Set Up Keys
 
-Copy `.env.example` to `.env` and fill in the values you actually want to use.
+Copy the example file to make your own config.
 
-Minimum practical setup:
+```bash
+cp .env.example .env
+```
 
-- `OPENAI_API_KEY`
-- `OPENAI_LLM_MODEL`
-- `OPENAI_EMBEDDING_MODEL`
-- `QDRANT_URL`
-- `QDRANT_API_KEY`
+Open the `.env` file. Add your OpenAI and Qdrant keys.
 
-Optional but useful:
+### 3. Set Up the Database
 
-- `GEMINI_API_KEY`, `GEMINI_MODEL` if you want Gemini for workflow steps
-- `VOYAGE_API_KEY` for reranking retrieved policy chunks
-- `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`
-- `PHOENIX_ENDPOINT`
-- `LANGWATCH_API_KEY`
-
-### 3. Initialize Qdrant collections
+Create the tables in Qdrant.
 
 ```bash
 legal-agent init-db
 ```
 
-This creates the two collections used by the system:
+### 4. Add Your Policy
 
-- `regulatory_updates`
-- `internal_policies`
-
-### 4. Load internal policies
-
-The current ingestion path is PDF-based:
+Load your company rules into the database.
 
 ```bash
 legal-agent load-policies-pdf "data/policies/your-policy.pdf"
 ```
 
-This pipeline parses the PDF with Docling, chunks it, enriches each chunk with metadata, computes embeddings, and upserts the result into `internal_policies`.
+### 5. Scrape New Laws
 
-### 5. Configure crawl targets
-
-Edit `data/sources/targets.json`. Each target defines:
-
-- one or more `start_urls`
-- the `jurisdiction`
-- crawl limits such as `max_depth`, `max_pages`, and `max_pdfs`
-- whether HTML links and PDF links should be followed
-
-### 6. Scrape regulations
+Find and save new rules from the web.
 
 ```bash
 legal-agent scrape
 ```
 
-You can also point to a different source file:
+You can change the sites to scrape in `data/sources/targets.json`.
 
-```bash
-legal-agent scrape --sources path/to/targets.json
-```
+### 6. Run the Agent
 
-### 7. Run the workflow
+Start the main job.
 
 ```bash
 legal-agent run-workflow
 ```
 
-The workflow processes one unprocessed regulatory document per run, marks it as processed in Qdrant, and writes Markdown and JSON reports into `data/reports/`.
-
-### 8. Check system status
-
-```bash
-legal-agent status
-```
-
-## Structural Choices
-
-### Why LlamaIndex Workflows
-
-For an event-driven agentic system that stays evaluable. `LlamaIndex Workflows` fits that well because it gives:
-
-- explicit step boundaries instead of a free-form agent loop
-- typed events between steps
-- easier tracing in observability tools
-- a simpler control flow than a large graph orchestration layer
-
-This repo uses one workflow class, `ComplianceWorkflow`, with explicit `@step` methods and custom event models in `workflow/events.py`.
-
-### Why Qdrant
-
-Qdrant is used as both the staging layer and the retrieval layer:
-
-- `regulatory_updates` stores scraped regulation chunks plus processing state
-- `internal_policies` stores chunked internal policy text for retrieval
-
-The collections are configured with dense and sparse vectors so the system can support hybrid retrieval rather than pure cosine similarity alone.
-
-### LLM and embedding choices
-
-The code supports a few operating modes:
-
-- **Default mode**: OpenAI for workflow LLM calls and OpenAI embeddings
-- **Gemini workflow mode**: Gemini for step execution, while embeddings can still remain OpenAI unless local legal embeddings are enabled
-- **Local legal model mode**: optional legal-domain embedding and small language models for offline or domain-specific experimentation
-
-The current model routing is intentional:
-
-- `analyst`, `redliner`, and `auditor` can use a stronger model
-- `relevance_check` can use a cheaper model
-- enrichment can be split onto a lower-cost model
-
-That separation keeps cost-sensitive steps cheap while preserving quality where reasoning quality matters most.
-
-### Retrieval design
-
-Policy retrieval is not just plain vector search. The `Librarian` step uses:
-
-- dense embeddings for semantic similarity
-- sparse embeddings for lexical/legal-term recall
-- reciprocal rank fusion in Qdrant
-- optional VoyageAI reranking for the final shortlist
-
-This is a sensible fit for legal/compliance text, where exact clause language often matters as much as semantic similarity.
-
-### Why an explicit auditor step
-
-The project plan emphasized hallucination control and evaluability. Instead of trusting a single generation pass, the workflow adds an `Auditor` step that:
-
-- checks for unsupported references and logic gaps
-- returns `PASS` or `FAIL`
-- can trigger a retry loop back through drafting
-
-That makes failure modes visible and gives you an auditable artifact instead of a silent best-effort answer.
-
-## Evaluation And Observability
-
-The repository already includes instrumentation hooks for the evaluation stack described in the project plan:
-
-- **Langfuse**: trace, latency, and cost visibility
-- **Arize Phoenix**: OpenInference/LlamaIndex tracing for RAG and workflow inspection
-- **LangWatch**: guardrail and monitoring integration
-
-### How to run eval-oriented workflow sessions
-
-1. Configure the relevant observability keys in `.env`.
-2. Run `legal-agent run-workflow`.
-3. Inspect the saved report in `data/reports/`.
-4. Review traces in Langfuse and Phoenix for the same run.
-
-### What you can evaluate today
-
-- **Retrieval quality**: inspect which policy chunks the `Librarian` retrieved for a regulation.
-- **Reasoning quality**: compare the `Analyst` gap table against the retrieved policy evidence.
-- **Draft quality**: review whether the `Redliner` output actually closes the listed gaps.
-- **Hallucination resistance**: use the `Auditor` result and notes as a first-pass factuality check.
-- **Operational behavior**: use Langfuse and Phoenix to inspect cost, latency, and step execution.
-
-### Important note on eval scope
-
-This repo currently provides instrumentation and inspectable artifacts, not a full standalone benchmark harness with labeled datasets and automated scoring scripts. In practice, evaluation is performed by:
-
-- running representative scrape and workflow jobs
-- inspecting traces and retrieved context
-- reviewing generated reports
-- extending the current test suite with task-specific regression cases when needed
-
-### Tests
-
-Run the current automated tests with:
-
-```bash
-pytest
-```
-
-The existing tests are lightweight smoke tests around chunking and workflow event construction. They are useful for sanity checks, but they are not a substitute for workflow-level evaluation on real regulatory samples.
+The agent will process one new law. It will save a report in the `data/reports/` folder.
 
 ## CLI Commands
 
-| Command | Purpose |
+| Command | What It Does |
 |---|---|
-| `legal-agent init-db` | Create the Qdrant collections and payload indexes |
-| `legal-agent scrape` | Crawl configured regulatory sources and stage results |
-| `legal-agent run-workflow` | Process unprocessed regulations through the compliance workflow |
-| `legal-agent load-policies-pdf FILE` | Ingest a policy PDF into the `internal_policies` collection |
-| `legal-agent status` | Show collection sizes and unprocessed regulation count |
-
-## Repository Structure
-
-```text
-.
-├── data/
-│   ├── policies/        # Source policy PDFs used for ingestion
-│   ├── reports/         # Generated Markdown and JSON workflow outputs
-│   └── sources/         # Crawl target definitions
-├── src/legal_agent/
-│   ├── cli.py           # Click CLI entrypoint
-│   ├── config.py        # Environment-backed application settings
-│   ├── db/              # Qdrant client and collection schema setup
-│   ├── instrumentation/ # Langfuse, Phoenix, and LangWatch setup
-│   ├── scraping/        # Spider, item models, and ingestion pipelines
-│   ├── utils/           # Embeddings, report writing, policy loaders
-│   └── workflow/        # Event models, prompts, LLM routing, workflow logic
-├── tests/               # Smoke tests for chunking and workflow events
-├── Project_map.md       # Original implementation plan and evaluation goals
-└── README.md
-```
-
-## End-To-End Flow
-
-```text
-targets.json
-   -> Scrapy spider
-   -> Docling PDF conversion / HTML extraction
-   -> chunking + metadata enrichment
-   -> Qdrant.regulatory_updates
-   -> ComplianceWorkflow
-   -> hybrid retrieval from Qdrant.internal_policies
-   -> analysis + drafting + audit
-   -> report written to data/reports
-```
+| `legal-agent init-db` | Sets up the database. |
+| `legal-agent scrape` | Finds new laws on the web. |
+| `legal-agent run-workflow` | Runs the main agent task. |
+| `legal-agent load-policies-pdf` | Loads a PDF policy into the database. |
+| `legal-agent status` | Shows how many laws are left to check. |
 
 ## License
 
