@@ -42,7 +42,20 @@ Copy the example file to make your own config.
 cp .env.example .env
 ```
 
-Open the `.env` file. Add your OpenAI and Qdrant keys.
+Open the `.env` file. Add your keys.  
+#### Minimum requirements:  
+- `OPENAI_API_KEY`
+- `OPENAI_LLM_MODEL`
+- `OPENAI_EMBEDDING_MODEL`
+- `QDRANT_URL`
+- `QDRANT_API_KEY`
+
+#### Optional but useful:  
+- `GEMINI_API_KEY`, `GEMINI_MODEL` if you want Gemini for workflow steps
+- `VOYAGE_API_KEY` 
+- `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`
+- `PHOENIX_ENDPOINT`
+- `LANGWATCH_API_KEY`
 
 ### 3. Set Up the Database
 
