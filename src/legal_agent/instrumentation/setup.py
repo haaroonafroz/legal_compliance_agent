@@ -22,6 +22,7 @@ def init_observability(settings: "Settings") -> None:
 
     _init_langfuse(settings)
     _init_phoenix(settings)
+    _init_llamaindex_instrumentation()
     _init_langwatch(settings)
 
     _INITIALISED = True
@@ -49,12 +50,16 @@ def _init_langfuse(settings: "Settings") -> None:
 
 
 def _init_phoenix(settings: "Settings") -> None:
+    if not settings.phoenix_endpoint:
+        logger.warning("Phoenix endpoint not set – skipping Phoenix init.")
+        return
+
     try:
         import phoenix as px
-        from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
-        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry import trace as otel_trace
-        from opentelemetry.sdk.trace.export import SimpleSpanProcessor
+        from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+        from opentelemetry.sdk.trace import TracerProvider
+        from opentelemetry.sdk.trace.export import BatchSpanProcessor
 
         # Launch local Phoenix server if using localhost endpoint
         if "localhost" in settings.phoenix_endpoint and not settings.phoenix_external:
@@ -62,18 +67,24 @@ def _init_phoenix(settings: "Settings") -> None:
 
         # Add Phoenix as a second OTel exporter so spans go to BOTH
         # Langfuse (already configured above) and Phoenix simultaneously.
-        phoenix_exporter = OTLPSpanExporter(
-            endpoint=f"{settings.phoenix_endpoint}/v1/traces"
-        )
+        phoenix_exporter = OTLPSpanExporter(endpoint=f"{settings.phoenix_endpoint}/v1/traces")
         provider = otel_trace.get_tracer_provider()
-        provider.add_span_processor(SimpleSpanProcessor(phoenix_exporter))
-
-        # Instrument LlamaIndex – this hooks into the OTel provider that
-        # Langfuse already configured, so all @step spans flow to Langfuse.
-        LlamaIndexInstrumentor().instrument()
+        if not hasattr(provider, "add_span_processor"):
+            provider = TracerProvider()
+            otel_trace.set_tracer_provider(provider)
+        provider.add_span_processor(BatchSpanProcessor(phoenix_exporter))
         logger.info("Arize Phoenix instrumentation active at %s", settings.phoenix_endpoint)
     except Exception:
         logger.warning("Phoenix init failed – RAG metrics unavailable.", exc_info=True)
+
+
+def _init_llamaindex_instrumentation() -> None:
+    try:
+        from openinference.instrumentation.llama_index import LlamaIndexInstrumentor
+
+        LlamaIndexInstrumentor().instrument()
+    except Exception:
+        logger.warning("LlamaIndex instrumentation failed.", exc_info=True)
 
 
 def _init_langwatch(settings: "Settings") -> None:
@@ -85,6 +96,6 @@ def _init_langwatch(settings: "Settings") -> None:
 
         # langwatch>=0.2.0 uses setup(), not login()
         langwatch.setup(api_key=settings.langwatch_api_key)
-        logger.info("LangWatch guardrails active.")
+        logger.info("LangWatch client initialised; no blocking guardrails are configured.")
     except Exception:
         logger.warning("LangWatch init failed.", exc_info=True)

@@ -3,30 +3,45 @@
 from __future__ import annotations
 
 import logging
-from typing import TYPE_CHECKING
 
 from qdrant_client.models import (
     Distance,
+    HnswConfigDiff,
     PayloadSchemaType,
-    SparseVectorParams,
     SparseIndexParams,
+    SparseVectorParams,
     VectorParams,
 )
 
-if TYPE_CHECKING:
-    from qdrant_client import QdrantClient
-
-    from legal_agent.config import Settings
-
 logger = logging.getLogger(__name__)
+
+
+def _dense_vector_params(size: int) -> VectorParams:
+    return VectorParams(
+        size=size,
+        distance=Distance.COSINE,
+        on_disk=False,
+        hnsw_config=HnswConfigDiff(m=24, payload_m=24, ef_construct=256),
+    )
+
 
 REGULATORY_PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
     "is_processed": PayloadSchemaType.BOOL,
+    "workflow_status": PayloadSchemaType.KEYWORD,
     "jurisdiction": PayloadSchemaType.KEYWORD,
     "source_url": PayloadSchemaType.KEYWORD,
+    "source_id": PayloadSchemaType.KEYWORD,
+    "source_key": PayloadSchemaType.KEYWORD,
     "document_id": PayloadSchemaType.KEYWORD,
+    "revision_id": PayloadSchemaType.KEYWORD,
     "document_hash": PayloadSchemaType.KEYWORD,
+    "is_current": PayloadSchemaType.BOOL,
+    "supersedes_revision_id": PayloadSchemaType.KEYWORD,
     "chunk_id": PayloadSchemaType.KEYWORD,
+    "document_type": PayloadSchemaType.KEYWORD,
+    "legal_identifier": PayloadSchemaType.KEYWORD,
+    "language": PayloadSchemaType.KEYWORD,
+    "validation_status": PayloadSchemaType.KEYWORD,
     "topic_tags": PayloadSchemaType.KEYWORD,
     "compliance_domain": PayloadSchemaType.KEYWORD,
     "applies_to_departments": PayloadSchemaType.KEYWORD,
@@ -39,22 +54,24 @@ POLICIES_PAYLOAD_INDEXES: dict[str, PayloadSchemaType] = {
     "policy_id": PayloadSchemaType.KEYWORD,
     "document_id": PayloadSchemaType.KEYWORD,
     "chunk_id": PayloadSchemaType.KEYWORD,
-    # "topic_tags": PayloadSchemaType.KEYWORD,
+    "topic_tags": PayloadSchemaType.KEYWORD,
     "compliance_domain": PayloadSchemaType.KEYWORD,
-    # "obligation_type": PayloadSchemaType.KEYWORD,
-}   
+    "obligation_type": PayloadSchemaType.KEYWORD,
+}
 
 
 def ensure_collections(client, settings):
-    dim = settings.legal_embedding_dim if settings.use_legal_embeddings else settings.openai_embedding_dim
+    dim = (
+        settings.legal_embedding_dim
+        if settings.use_legal_embeddings
+        else settings.openai_embedding_dim
+    )
     # regulatory_updates: dense="compliance", sparse="legal_clause"
     _ensure_one(
         client,
         name=settings.qdrant_regulatory_collection,
         vectors_config={
-            settings.qdrant_regulatory_dense_name: VectorParams(
-                size=dim, distance=Distance.COSINE
-            ),
+            settings.qdrant_regulatory_dense_name: _dense_vector_params(dim),
         },
         sparse_vectors_config={
             settings.qdrant_sparse_name: SparseVectorParams(
@@ -69,9 +86,7 @@ def ensure_collections(client, settings):
         client,
         name=settings.qdrant_policies_collection,
         vectors_config={
-            settings.qdrant_policies_dense_name: VectorParams(
-                size=dim, distance=Distance.COSINE
-            ),
+            settings.qdrant_policies_dense_name: _dense_vector_params(dim),
         },
         sparse_vectors_config={
             settings.qdrant_sparse_name: SparseVectorParams(
@@ -81,7 +96,6 @@ def ensure_collections(client, settings):
         },
         indexes=POLICIES_PAYLOAD_INDEXES,
     )
-
 
 
 def _ensure_one(client, *, name, vectors_config, sparse_vectors_config, indexes):

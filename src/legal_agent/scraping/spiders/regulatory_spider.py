@@ -41,8 +41,10 @@ from __future__ import annotations
 import json
 import logging
 import random
+from collections.abc import AsyncIterator, Iterator
+from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any, Iterator
+from typing import Any
 from urllib.parse import urlparse
 
 import scrapy
@@ -50,13 +52,16 @@ import trafilatura
 from scrapy.exceptions import NotSupported
 from scrapy.http import Response
 
+from legal_agent.scraping.adapters import SourceTarget, get_source_adapter
 from legal_agent.scraping.items import RegulatoryDocumentItem
+from legal_agent.utils.identity import canonicalize_url, source_key
 
 logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Brotli availability
 # ---------------------------------------------------------------------------
+
 
 def _brotli_available() -> bool:
     for mod in ("brotlicffi", "brotli"):
@@ -92,10 +97,7 @@ _USER_AGENTS = [
         "AppleWebKit/605.1.15 (KHTML, like Gecko) "
         "Version/17.3 Safari/605.1.15"
     ),
-    (
-        "Mozilla/5.0 (X11; Linux x86_64; rv:124.0) "
-        "Gecko/20100101 Firefox/124.0"
-    ),
+    ("Mozilla/5.0 (X11; Linux x86_64; rv:124.0) Gecko/20100101 Firefox/124.0"),
 ]
 
 _BASE_HEADERS: dict[str, str] = {
@@ -129,16 +131,24 @@ def _browser_headers(referer: str | None = None) -> dict[str, str]:
 # Per-job crawl state
 # ---------------------------------------------------------------------------
 
+
 class _JobState:
     """Tracks quotas and config for a single targets.json start_url entry."""
 
     __slots__ = (
-        "jurisdiction", "allowed_domains",
-        "follow_links", "follow_pdf",
-        "max_depth", "max_pages", "max_pdfs",
-        "pages_seen", "pdfs_seen",
-        "html_requests_pending", "pdf_requests_pending",
-        "allow_patterns", "deny_patterns",
+        "jurisdiction",
+        "allowed_domains",
+        "follow_links",
+        "follow_pdf",
+        "max_depth",
+        "max_pages",
+        "max_pdfs",
+        "pages_seen",
+        "pdfs_seen",
+        "html_requests_pending",
+        "pdf_requests_pending",
+        "allow_patterns",
+        "deny_patterns",
     )
 
     def __init__(
@@ -159,9 +169,9 @@ class _JobState:
         self.allowed_domains = [d.lstrip("*.") for d in allowed_domains]
         self.follow_links = follow_links
         self.follow_pdf = follow_pdf
-        self.max_depth = max_depth   # 0 = unlimited
-        self.max_pages = max_pages   # 0 = unlimited
-        self.max_pdfs = max_pdfs     # 0 = unlimited
+        self.max_depth = max_depth  # 0 = unlimited
+        self.max_pages = max_pages  # 0 = unlimited
+        self.max_pdfs = max_pdfs  # 0 = unlimited
         self.allow_patterns = allow_patterns
         self.deny_patterns = deny_patterns
         self.pages_seen = 0
@@ -171,7 +181,9 @@ class _JobState:
 
     # -- quota helpers --------------------------------------------------
     def html_slot_available(self) -> bool:
-        return self.max_pages == 0 or (self.pages_seen + self.html_requests_pending) < self.max_pages
+        return (
+            self.max_pages == 0 or (self.pages_seen + self.html_requests_pending) < self.max_pages
+        )
 
     def pdf_slot_available(self) -> bool:
         return self.max_pdfs == 0 or (self.pdfs_seen + self.pdf_requests_pending) < self.max_pdfs
@@ -191,21 +203,18 @@ class _JobState:
         if not self.allowed_domains:
             return True
         host = urlparse(url).hostname or ""
-        return any(
-            host == d or host.endswith("." + d)
-            for d in self.allowed_domains
-        )
+        return any(host == d or host.endswith("." + d) for d in self.allowed_domains)
 
     def claim_page(self) -> None:
         self.pages_seen += 1
 
     def claim_pdf(self) -> None:
         self.pdfs_seen += 1
-    
+
     def url_allowed(self, url: str) -> bool:
         """True if URL passes allow_patterns and deny_patterns."""
-        from urllib.parse import urlparse
         import re
+        from urllib.parse import urlparse
 
         path = urlparse(url).path or "/"
         # Deny wins: if any deny pattern matches, reject
@@ -233,6 +242,7 @@ class _JobState:
 # Spider
 # ---------------------------------------------------------------------------
 
+
 class RegulatorySpider(scrapy.Spider):
     """Scrape regulatory/legal documents driven by targets.json."""
 
@@ -246,7 +256,6 @@ class RegulatorySpider(scrapy.Spider):
         },
         "DOWNLOAD_TIMEOUT": 45,
         "REACTOR_THREADPOOL_MAXSIZE": 20,
-
         # --- retry ---
         "RETRY_ENABLED": True,
         "RETRY_TIMES": 5,
@@ -259,7 +268,6 @@ class RegulatorySpider(scrapy.Spider):
             "scrapy.core.downloader.handlers.http11.TunnelError",
             "builtins.IOError",
         ],
-
         # --- politeness ---
         "AUTOTHROTTLE_ENABLED": True,
         "AUTOTHROTTLE_START_DELAY": 2.0,
@@ -269,10 +277,9 @@ class RegulatorySpider(scrapy.Spider):
         "RANDOMIZE_DOWNLOAD_DELAY": True,
         "DOWNLOAD_DELAY": 2,
         "CONCURRENT_REQUESTS_PER_DOMAIN": 1,
-
         # --- misc ---
         "COOKIES_ENABLED": True,
-        "ROBOTSTXT_OBEY": False,
+        "ROBOTSTXT_OBEY": True,
         "REDIRECT_ENABLED": True,
         "REDIRECT_MAX_TIMES": 5,
         "LOG_LEVEL": "ERROR",
@@ -289,13 +296,13 @@ class RegulatorySpider(scrapy.Spider):
         self.sources_file = sources_file
         # job_key (= start_url) → _JobState
         self._jobs: dict[str, _JobState] = {}
-        
+        self._source_targets: dict[str, SourceTarget] = {}
 
     # ------------------------------------------------------------------
     # Request generation
     # ------------------------------------------------------------------
 
-    def start_requests(self) -> Iterator[scrapy.Request]:
+    def _iter_start_requests(self) -> Iterator[scrapy.Request]:
         path = Path(self.sources_file)
         if not path.exists():
             logger.error("Sources file not found: %s", path)
@@ -303,57 +310,114 @@ class RegulatorySpider(scrapy.Spider):
 
         targets: list[dict[str, Any]] = json.loads(path.read_text(encoding="utf-8"))
 
-        for target in targets:
-            jurisdiction: str = target["jurisdiction"]
-            allowed_domains: list[str] = target.get("allowed_domains", [])
-            follow_links: bool = bool(target.get("follow_links", False))
-            follow_pdf: bool = bool(target.get("follow_pdf", False))
-            max_depth: int = int(target.get("max_depth", 2))
-            max_pages: int = int(target.get("max_pages", 0))
-            max_pdfs: int = int(target.get("max_pdfs", 0))
-            allow_patterns: list[str] = target.get("allow_patterns", [])
-            deny_patterns: list[str] = target.get("deny_patterns", [])
-
-            for url in target["start_urls"]:
-                # Use the start URL as the job key so each entry point gets
-                # its own independent quota counters.
-                job_key = url
+        for target_index, target_config in enumerate(targets):
+            target = SourceTarget.from_dict(
+                target_config,
+                default_id=f"source-{target_index + 1}",
+            )
+            self._source_targets[target.source_id] = target
+            adapter = get_source_adapter(target.adapter)
+            if adapter is not None:
+                job_key = target.source_id
                 self._jobs[job_key] = _JobState(
-                    jurisdiction=jurisdiction,
-                    allowed_domains=allowed_domains,
-                    allow_patterns=allow_patterns,
-                    deny_patterns=deny_patterns,
-                    follow_links=follow_links,
-                    follow_pdf=follow_pdf,
-                    max_depth=max_depth,
-                    max_pages=max_pages,
-                    max_pdfs=max_pdfs,
+                    jurisdiction=target.jurisdiction,
+                    allowed_domains=list(target.allowed_domains),
+                    allow_patterns=list(target.allow_patterns),
+                    deny_patterns=list(target.deny_patterns),
+                    follow_links=bool(target.options.get("follow_links", False)),
+                    follow_pdf=bool(target.options.get("follow_pdf", True)),
+                    max_depth=int(target.options.get("max_depth", 0)),
+                    max_pages=int(target.options.get("max_pages", 0)),
+                    max_pdfs=int(target.options.get("max_pdfs", 0)),
                 )
-                logger.info(
-                    "Job queued: %s | depth≤%s  pages≤%s  pdfs≤%s",
-                    url,
-                    max_depth or "∞",
-                    max_pages or "∞",
-                    max_pdfs or "∞",
-                )
-                yield scrapy.Request(
-                    url,
-                    callback=self.parse,
-                    headers=_browser_headers(),
-                    dont_filter=False,
-                    meta={
-                        "job_key": job_key,
-                        "depth": 0,
-                        "download_timeout": 45,
-                        "handle_httpstatus_list": [403, 404, 410, 429],
-                    },
-                )
+                yield from adapter.discovery_requests(target)
+                continue
+
+            yield from self._start_generic_target(target)
+
+    def _start_generic_target(self, target: SourceTarget) -> Iterator[scrapy.Request]:
+        """Create requests for legacy targets without a source adapter."""
+        for url in target.start_urls:
+            job_key = url
+            self._jobs[job_key] = _JobState(
+                jurisdiction=target.jurisdiction,
+                allowed_domains=list(target.allowed_domains),
+                allow_patterns=list(target.allow_patterns),
+                deny_patterns=list(target.deny_patterns),
+                follow_links=bool(target.options.get("follow_links", False)),
+                follow_pdf=bool(target.options.get("follow_pdf", False)),
+                max_depth=int(target.options.get("max_depth", 2)),
+                max_pages=int(target.options.get("max_pages", 0)),
+                max_pdfs=int(target.options.get("max_pdfs", 0)),
+            )
+            logger.info(
+                "Job queued: %s | depth≤%s  pages≤%s  pdfs≤%s",
+                url,
+                target.options.get("max_depth", 2) or "∞",
+                target.options.get("max_pages", 0) or "∞",
+                target.options.get("max_pdfs", 0) or "∞",
+            )
+            yield scrapy.Request(
+                url,
+                callback=self.parse,
+                headers=_browser_headers(),
+                dont_filter=False,
+                meta={
+                    "job_key": job_key,
+                    "depth": 0,
+                    "download_timeout": 45,
+                    "handle_httpstatus_list": [403, 404, 410, 429],
+                },
+            )
+
+    # ------------------------------------------------------------------
+    # Adapter discovery
+    # ------------------------------------------------------------------
+
+    def _parse_adapter_discovery(
+        self, response: Response
+    ) -> Iterator[scrapy.Request]:
+        source_id = response.meta["source_id"]
+        target = self._source_targets[source_id]
+        adapter = get_source_adapter(target.adapter)
+        if adapter is None:
+            return
+
+        for document in adapter.parse_discovery(response, target):
+            metadata = document.as_meta()
+            url = canonicalize_url(document.url)
+            yield scrapy.Request(
+                url,
+                callback=self.parse,
+                headers=_browser_headers(referer=response.url),
+                meta={
+                    "job_key": source_id,
+                    "depth": 0,
+                    "targeted_document": True,
+                    "document_metadata": metadata,
+                    "download_timeout": 45,
+                    "handle_httpstatus_list": [403, 404, 410, 429],
+                },
+            )
+
+    async def start(self) -> AsyncIterator[scrapy.Request]:
+        """Yield configured start requests for Scrapy 2.13 and newer."""
+        for request in self._iter_start_requests():
+            yield request
+
+    def start_requests(self) -> Iterator[scrapy.Request]:
+        """Keep compatibility with Scrapy versions older than 2.13."""
+        yield from self._iter_start_requests()
 
     # ------------------------------------------------------------------
     # Main dispatcher
     # ------------------------------------------------------------------
     def parse(self, response: Response) -> Iterator[RegulatoryDocumentItem | scrapy.Request]:
         """Route each response to the PDF or HTML handler."""
+        if response.meta.get("discovery"):
+            yield from self._parse_adapter_discovery(response)
+            return
+
         job_key: str = response.meta["job_key"]
         depth: int = response.meta.get("depth", 0)
         job: _JobState = self._jobs[job_key]
@@ -361,7 +425,7 @@ class RegulatorySpider(scrapy.Spider):
         if response.status == 429:
             logger.warning("Rate-limited (429) on %s – retrying.", response.url)
             return
-        if response.status in (403, 410):
+        if response.status in (403, 404, 410):
             logger.warning("Blocked/gone (%s) on %s – skipping.", response.status, response.url)
             return
 
@@ -388,24 +452,30 @@ class RegulatorySpider(scrapy.Spider):
         if not job.pdf_allowed():
             logger.info(
                 "PDF quota (%d) reached – skipping %s",
-                job.max_pdfs, response.url,
+                job.max_pdfs,
+                response.url,
             )
             return
 
         job.claim_pdf()
         logger.info(
             "[pdf %d/%s] %s",
-            job.pdfs_seen, job.max_pdfs or "∞", response.url,
+            job.pdfs_seen,
+            job.max_pdfs or "∞",
+            response.url,
         )
         yield RegulatoryDocumentItem(
-            title=response.url.split("/")[-1],
+            title=response.meta.get("document_metadata", {}).get("title")
+            or response.url.split("/")[-1],
             full_text="",
             jurisdiction=job.jurisdiction,
-            effective_date="",
-            source_url=response.url,
+            effective_date=response.meta.get("document_metadata", {}).get("effective_date", ""),
+            source_url=canonicalize_url(response.url),
+            **self._document_fields(response),
             is_pdf=True,
             raw_pdf_bytes=response.body,
         )
+
     # ------------------------------------------------------------------
     # HTML handler
     # ------------------------------------------------------------------
@@ -415,13 +485,14 @@ class RegulatorySpider(scrapy.Spider):
         try:
             return response.text
         except NotSupported:
-            encoding = response.headers.get(
-                "Content-Encoding", b""
-            ).decode("utf-8", errors="ignore")
+            encoding = response.headers.get("Content-Encoding", b"").decode(
+                "utf-8", errors="ignore"
+            )
             logger.error(
                 "Cannot decode %s (Content-Encoding: %s). "
                 "Install brotli support: pip install brotlicffi",
-                response.url, encoding or "unknown",
+                response.url,
+                encoding or "unknown",
             )
             try:
                 return response.body.decode("utf-8", errors="replace")
@@ -440,14 +511,17 @@ class RegulatorySpider(scrapy.Spider):
         if not job.page_allowed():
             logger.info(
                 "Page quota (%d) reached – skipping %s",
-                job.max_pages, response.url,
+                job.max_pages,
+                response.url,
             )
             return
         job.claim_page()
         logger.info(
             "[page %d/%s  depth %d/%s] %s",
-            job.pages_seen, job.max_pages or "∞",
-            depth, job.max_depth or "∞",
+            job.pages_seen,
+            job.max_pages or "∞",
+            depth,
+            job.max_depth or "∞",
             response.url,
         )
 
@@ -457,7 +531,8 @@ class RegulatorySpider(scrapy.Spider):
             return
 
         # -- content extraction -----------------------------------------
-        title = response.css("title::text").get(default="").strip()
+        document_metadata = response.meta.get("document_metadata", {})
+        title = document_metadata.get("title") or response.css("title::text").get(default="").strip()
 
         extracted: str | None = None
         try:
@@ -474,9 +549,7 @@ class RegulatorySpider(scrapy.Spider):
 
         if not extracted:
             logger.warning("trafilatura empty for %s – CSS fallback.", response.url)
-            paragraphs = response.css(
-                "p::text, li::text, h1::text, h2::text, h3::text"
-            ).getall()
+            paragraphs = response.css("p::text, li::text, h1::text, h2::text, h3::text").getall()
             extracted = "\n".join(p.strip() for p in paragraphs if p.strip())
 
         if not title:
@@ -495,8 +568,9 @@ class RegulatorySpider(scrapy.Spider):
                 title=title,
                 full_text=extracted,
                 jurisdiction=job.jurisdiction,
-                effective_date="",
-                source_url=response.url,
+                effective_date=document_metadata.get("effective_date", ""),
+                source_url=canonicalize_url(response.url),
+                **self._document_fields(response),
                 is_pdf=False,
                 raw_pdf_bytes=b"",
             )
@@ -535,7 +609,7 @@ class RegulatorySpider(scrapy.Spider):
                 )
 
         # HTML page links: walk index → individual guideline pages.
-        if job.follow_links:
+        if job.follow_links and not response.meta.get("targeted_document"):
             for href in response.css("a::attr(href)").getall():
                 if href.lower().endswith(".pdf"):
                     continue  # already handled above
@@ -562,3 +636,30 @@ class RegulatorySpider(scrapy.Spider):
                         "handle_httpstatus_list": [403, 404, 410, 429],
                     },
                 )
+
+    @staticmethod
+    def _document_fields(response: Response) -> dict[str, str]:
+        """Map adapter metadata and response headers onto a document item."""
+        metadata = response.meta.get("document_metadata", {})
+        url = canonicalize_url(response.url)
+        source_id = metadata.get("source_id", "generic")
+        return {
+            "source_id": source_id,
+            "source_key": source_key(
+                source_id,
+                url,
+                external_id=metadata.get("legal_identifier", ""),
+            ),
+            "document_type": metadata.get("document_type", ""),
+            "published_at": metadata.get("published_at", ""),
+            "legal_identifier": metadata.get("legal_identifier", ""),
+            "language": metadata.get("language", ""),
+            "discovery_url": metadata.get("discovery_url", ""),
+            "mime_type": metadata.get("mime_type", "")
+            or response.headers.get("Content-Type", b"").decode("utf-8", errors="ignore"),
+            "retrieved_at": datetime.now(UTC).isoformat(),
+            "etag": response.headers.get("ETag", b"").decode("utf-8", errors="ignore"),
+            "last_modified": response.headers.get("Last-Modified", b"").decode(
+                "utf-8", errors="ignore"
+            ),
+        }

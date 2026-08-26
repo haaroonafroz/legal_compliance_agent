@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import logging
-import sys
 
 import click
 
@@ -28,9 +26,11 @@ def init_db() -> None:
     """Create Qdrant collections and payload indexes."""
     settings = get_settings()
     from legal_agent.db import ensure_collections, get_qdrant_client
+    from legal_agent.db.manifest import DocumentManifest
 
     client = get_qdrant_client(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     ensure_collections(client, settings)
+    DocumentManifest(settings.manifest_file)
     click.echo("Qdrant collections initialised.")
 
 
@@ -55,9 +55,7 @@ def scrape(sources: str | None, log_level: str) -> None:
     extracted regulatory documents into the pipeline (Qdrant by default).
     """
     from scrapy.crawler import CrawlerProcess
-    from scrapy.utils.project import get_project_settings as _scrapy_project_settings
 
-    from legal_agent.scraping.spiders.regulatory_spider import RegulatorySpider
     from legal_agent.scraping.settings import (
         BOT_NAME,
         CONCURRENT_REQUESTS,
@@ -66,6 +64,7 @@ def scrape(sources: str | None, log_level: str) -> None:
         DOWNLOAD_DELAY,
         ITEM_PIPELINES,
     )
+    from legal_agent.scraping.spiders.regulatory_spider import RegulatorySpider
 
     settings = get_settings()
     sources_file = sources or settings.sources_file
@@ -87,33 +86,62 @@ def scrape(sources: str | None, log_level: str) -> None:
     click.echo("Scraping complete.")
 
 
+@cli.command("retry-dead-letters")
+@click.option("--limit", default=100, show_default=True, type=click.IntRange(min=1))
+def retry_dead_letters(limit: int) -> None:
+    """Requeue failed acquisitions for the next scrape run."""
+    settings = get_settings()
+    from legal_agent.db.manifest import DocumentManifest
+
+    manifest = DocumentManifest(settings.manifest_file)
+    records = manifest.retryable(limit=limit)
+    for record in records:
+        manifest.reset_for_retry(record["revision_id"])
+    click.echo(f"Requeued {len(records)} dead-lettered document(s).")
+    if records:
+        click.echo("Run `legal-agent scrape` to retry acquisition.")
+
+
 @cli.command()
 def run_workflow() -> None:
     """Process unprocessed regulations through the compliance workflow."""
     settings = get_settings()
 
-    from legal_agent.instrumentation import init_observability
-    from langfuse import get_client, propagate_attributes
-    from legal_agent.workflow import ComplianceWorkflow
-    from legal_agent.utils.report import save_report
     import datetime
+
+    from langfuse import get_client, propagate_attributes
+
+    from legal_agent.instrumentation import init_observability
+    from legal_agent.utils.report import save_report
+    from legal_agent.workflow import ComplianceWorkflow
 
     init_observability(settings)
 
     async def _run() -> None:
-        wf = ComplianceWorkflow(settings=settings, timeout=300)
+        model_name = (
+            settings.local_llm_model if settings.use_local_llm else settings.openai_llm_model
+        )
+        processed = 0
         with propagate_attributes(
-            session_id=f"batch-{datetime.date.today().isoformat()}",
-            tags=["compliance-workflow", settings.openai_llm_model],
+            session_id=f"batch-{datetime.datetime.now(datetime.UTC).date().isoformat()}",
+            tags=["compliance-workflow", model_name],
             version="0.1.0",
         ):
-            result = await wf.run()
+            while True:
+                wf = ComplianceWorkflow(settings=settings, timeout=300)
+                result = await wf.run()
 
-        if isinstance(result, dict) and result.get("reports") == []:
+                if isinstance(result, dict) and result.get("reports") == []:
+                    break
+
+                path = save_report(result)
+                processed += 1
+                click.echo(f"Report saved to {path} (status={result.get('status', 'unknown')})")
+
+        if processed == 0:
             click.echo("No unprocessed regulations found.")
-            return
-        path = save_report(result)
-        click.echo(f"Report saved to {path}")
+        else:
+            click.echo(f"Processed {processed} regulation document(s).")
 
     asyncio.run(_run())
 
@@ -121,27 +149,35 @@ def run_workflow() -> None:
         get_client().flush()
         logger.info("Langfuse spans flushed.")
     except Exception:
-        pass
+        logger.debug("Langfuse flush skipped.", exc_info=True)
 
 
 @cli.command("load-policies-pdf")
-@click.argument("pdf_file", default="data\policies\dl-binding-corporate-rules-privacy.pdf", type=click.Path(exists=True, dir_okay=False))
+@click.argument(
+    "pdf_file",
+    default="data/policies/dl-binding-corporate-rules-privacy.pdf",
+    type=click.Path(exists=True, dir_okay=False),
+)
 @click.option(
-    "--department", default="",
+    "--department",
+    default="",
     help=(
         "Hard-override department for every chunk (e.g. 'Legal', 'HR'). "
         "When omitted the enrichment model infers it per chunk."
     ),
 )
 @click.option(
-    "--domain", default="",
+    "--domain",
+    default="",
     help=(
         "Hard-override compliance_domain (e.g. 'GDPR', 'ISO27001'). "
         "When omitted the enrichment model infers it per chunk."
     ),
 )
 @click.option(
-    "--batch-size", default=32, show_default=True,
+    "--batch-size",
+    default=32,
+    show_default=True,
     help="Chunks per embedding + Qdrant upsert batch.",
 )
 def load_policies_pdf(
@@ -151,22 +187,26 @@ def load_policies_pdf(
     batch_size: int,
 ) -> None:
     from pathlib import Path
+
     from legal_agent.utils.loader import ingest_policy_pdf
- 
+
     settings = get_settings()
     pdf_path = Path(pdf_file)
- 
+
     click.echo(f"Ingesting '{pdf_path.name}' …")
     click.echo(f"  Target collection : {settings.qdrant_policies_collection}")
-    click.echo(
-        f"  Enrichment model  : "
-        f"{'SLM (' + settings.legal_slm_model + ')' if settings.use_legal_slm else settings.openai_llm_model_enrichment}"
-    )
+    if settings.use_local_llm:
+        enrichment_model = f"local {settings.local_llm_model}"
+    elif settings.use_gemini_enrichment:
+        enrichment_model = settings.gemini_model
+    else:
+        enrichment_model = settings.openai_llm_model_enrichment
+    click.echo(f"  Enrichment model  : {enrichment_model}")
     if department:
         click.echo(f"  Department override : {department}")
     if domain:
         click.echo(f"  Domain override     : {domain}")
- 
+
     n = ingest_policy_pdf(
         pdf_path,
         settings,
@@ -174,7 +214,7 @@ def load_policies_pdf(
         compliance_domain=domain,
         batch_size=batch_size,
     )
- 
+
     click.echo(f"\nDone – {n} chunks upserted into '{settings.qdrant_policies_collection}'.")
 
 
@@ -183,6 +223,7 @@ def status() -> None:
     """Show system status: Qdrant collections and unprocessed document count."""
     settings = get_settings()
     from legal_agent.db.client import client_from_settings
+    from legal_agent.db.manifest import DocumentManifest
 
     client = client_from_settings(settings)
 
@@ -195,16 +236,50 @@ def status() -> None:
 
     from qdrant_client.models import FieldCondition, Filter, MatchValue
 
+    def _count_documents(workflow_filter: Filter) -> int:
+        document_ids: set[str] = set()
+        next_offset = None
+        while True:
+            points, next_offset = client.scroll(
+                collection_name=settings.qdrant_regulatory_collection,
+                scroll_filter=workflow_filter,
+                limit=256,
+                offset=next_offset,
+                with_payload=["document_id"],
+                with_vectors=False,
+            )
+            document_ids.update(
+                point.payload["document_id"]
+                for point in points
+                if point.payload and point.payload.get("document_id")
+            )
+            if next_offset is None:
+                return len(document_ids)
+
     try:
-        unprocessed = client.count(
-            collection_name=settings.qdrant_regulatory_collection,
-            count_filter=Filter(
-                must=[FieldCondition(key="is_processed", match=MatchValue(value=False))]
-            ),
+        unprocessed = _count_documents(
+            Filter(must=[FieldCondition(key="is_processed", match=MatchValue(value=False))])
         )
-        click.echo(f"  Unprocessed regulations: {unprocessed.count}")
+        click.echo(f"  Unprocessed regulations: {unprocessed}")
+        review_required = _count_documents(
+            Filter(
+                must=[
+                    FieldCondition(
+                        key="workflow_status",
+                        match=MatchValue(value="review_required"),
+                    )
+                ]
+            )
+        )
+        click.echo(f"  Regulations requiring review: {review_required}")
     except Exception:
-        click.echo("  Could not count unprocessed regulations.")
+        click.echo("  Could not count workflow states.")
+
+    manifest_counts = DocumentManifest(settings.manifest_file).counts()
+    if manifest_counts:
+        click.echo("  Acquisition manifest:")
+        for state, count in sorted(manifest_counts.items()):
+            click.echo(f"    {state}: {count}")
 
 
 if __name__ == "__main__":

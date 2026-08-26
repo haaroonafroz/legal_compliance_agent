@@ -23,6 +23,14 @@ class NewLawEvent(Event):
     compliance_domain: str = ""
     applies_to_departments: list[str] = Field(default_factory=list)
     obligation_type: str = ""
+    source_id: str = ""
+    source_key: str = ""
+    revision_id: str = ""
+    document_type: str = ""
+    published_at: str = ""
+    legal_identifier: str = ""
+    language: str = ""
+    is_current: bool = True
 
 
 class RetrievedContextEvent(Event):
@@ -31,12 +39,17 @@ class RetrievedContextEvent(Event):
     regulation: NewLawEvent
     matched_policies: list[dict]
     retrieval_scores: list[float] = Field(default_factory=list)
+    reranker_used: bool = False
+
 
 class RelevantContextEvent(Event):
     """Emitted by relevance_check when the document is relevant. Analyst subscribes to this."""
+
     regulation: NewLawEvent  # or reuse the regulation fields
     matched_policies: list[dict]
     retrieval_scores: list[float]
+    reranker_used: bool = False
+
 
 class AnalysisCompleteEvent(Event):
     """Emitted by the Analyst with the gap analysis between regulation and policies."""
@@ -70,9 +83,23 @@ class FinalReportEvent(Event):
     """Terminal event containing the complete compliance report for one regulation."""
 
     document_id: str
+    document_hash: str
     jurisdiction: str
     source_url: str
     gap_analysis: str
     proposed_updates: str
     audit_notes: str
     passed: bool
+    status: str
+    matched_policies: list[dict] = Field(default_factory=list)
+    retrieval_scores: list[float] = Field(default_factory=list)
+    reranker_used: bool = False
+    audit_retries: int = 0
+    source_id: str = ""
+    source_key: str = ""
+    revision_id: str = ""
+    document_type: str = ""
+    published_at: str = ""
+    legal_identifier: str = ""
+    language: str = ""
+    is_current: bool = True

@@ -66,20 +66,20 @@ Copy the example file to make your own config.
 cp .env.example .env
 ```
 
-Open the `.env` file. Add your keys.  
+Open the `.env` file. Add your keys.
 
 #### Minimum requirements:
 
 - `OPENAI_API_KEY`
-- `OPENAI_LLM_MODEL`
 - `OPENAI_EMBEDDING_MODEL`
 - `QDRANT_URL`
 - `QDRANT_API_KEY`
+- `LOCAL_LLM_BASE_URL` when `USE_LOCAL_LLM=true`
 
 #### Optional but useful:
 
 - `GEMINI_API_KEY`, `GEMINI_MODEL` if you want Gemini for workflow steps
-- `VOYAGE_API_KEY` 
+- `VOYAGE_API_KEY`
 - `LANGFUSE_PUBLIC_KEY`, `LANGFUSE_SECRET_KEY`, `LANGFUSE_HOST`
 - `PHOENIX_ENDPOINT`
 - `LANGWATCH_API_KEY`
@@ -118,7 +118,8 @@ Start the main job.
 legal-agent run-workflow
 ```
 
-The agent will process one new law. It will save a report in the `data/reports/` folder.
+The agent processes all complete, pending regulatory documents and saves one report per
+document in the `data/reports/` folder.
 
 ## CLI Commands
 
@@ -127,6 +128,7 @@ The agent will process one new law. It will save a report in the `data/reports/`
 | ------------------------------- | -------------------------------------- |
 | `legal-agent init-db`           | Sets up the database.                  |
 | `legal-agent scrape`            | Finds new laws on the web.             |
+| `legal-agent retry-dead-letters` | Requeues failed acquisitions for retry. |
 | `legal-agent run-workflow`      | Runs the main agent task.              |
 | `legal-agent load-policies-pdf` | Loads a PDF policy into the database.  |
 | `legal-agent status`            | Shows how many laws are left to check. |
@@ -168,7 +170,7 @@ This repo sends OTEL traces to Phoenix at `PHOENIX_ENDPOINT` (HTTP OTLP path `/v
 1. Start Phoenix so the UI is on port **6006** (see [Arize Phoenix docs](https://docs.arize.com/phoenix) for the current Docker image / command).
 2. In `.env`:
   - `PHOENIX_ENDPOINT=http://localhost:6006`
-  - `PHOENIX_EXTERNAL=true`  
+  - `PHOENIX_EXTERNAL=true`
    So the app does **not** try to spawn another server; it only exports spans to the running instance.
 3. **Dashboard:** open `http://localhost:6006` and inspect traces / LlamaIndex spans.
 
@@ -176,7 +178,7 @@ This repo sends OTEL traces to Phoenix at `PHOENIX_ENDPOINT` (HTTP OTLP path `/v
 
 1. In `.env`:
   - `PHOENIX_ENDPOINT=http://localhost:6006`
-  - `PHOENIX_EXTERNAL=false`  
+  - `PHOENIX_EXTERNAL=false`
    When `localhost` is in the URL and `PHOENIX_EXTERNAL` is false, `phoenix.launch_app()` can start the server for you during `run-workflow`.
 2. Open `http://localhost:6006` for the Phoenix UI.
 
@@ -202,14 +204,35 @@ Qdrant is used as both the staging layer and the retrieval layer:
 - `internal_policies` stores chunked internal policy text for retrieval
 The collections are configured with dense and sparse vectors so the system can support hybrid retrieval rather than pure cosine similarity alone.
 
+## Regulatory acquisition
+
+Configured sources use source-specific adapters. The EDPB adapter polls the official
+publications feed first and uses the configured publication pages as a targeted
+backfill; it does not follow arbitrary links by default. EUR-Lex/CELLAR documents are
+configured explicitly by URL or CELEX identifier.
+
+Before a document reaches enrichment or Qdrant, deterministic checks validate its
+status, extracted length, navigation content, and legal-content signals. Only
+borderline candidates use the cheaper content-validation model. Rejected documents
+are recorded in `QUARANTINE_FILE`.
+
+The document manifest at `MANIFEST_FILE` tracks canonical source identities and
+content revisions. Unchanged revisions are skipped, while changed revisions
+supersede older ones. Conversion, model, and persistence failures become
+dead-lettered records that can be requeued with `legal-agent retry-dead-letters`.
+
+Regulatory documents move from `pending` to `approved`, `review_required`, or
+`irrelevant`. A failed final audit is retained as `review_required`; it is not silently
+treated as an approved compliance result.
+
 ## LLM and Embedding Model choices
 
 The code supports several operating modes to balance cost, performance, and domain specificity:
 
-- **Default mode**: OpenAI models are used as the default for both workflow LLM calls and embeddings.
-- **Gemini workflow mode**: You can use Gemini models for step execution. A key advantage here is the ability to configure distinct "thinking modes" (e.g., `minimal`, `low`, `medium`, `high`) for different stages directly in `src\legal_agent\config.py`, allowing you to tune the reasoning depth according to your specific detailing needs.
-- **Local SLM (Small Language Model) mode**: For the metadata enrichment step, you can opt to use `Equall/Saul-7B-Instruct-v1` (or a fine-tuned version of it). As one of the top available SLMs trained on legal corpora on HuggingFace, this is an excellent cost-saving option if hosted locally, provided the input format and noise are controlled.
-- **Local Legal Embeddings**: You can use `nlpaueb/legal-bert-base-uncased` (or a fine-tuned version) instead of standard OpenAI embeddings. This provides a much more use-case specific vector representation for legal texts.
+- **Local llama.cpp mode (default):** workflow and enrichment calls use the OpenAI-compatible server configured by `LOCAL_LLM_BASE_URL` (default `http://localhost:8001/v1`). Qwen thinking is disabled for enrichment and relevance, medium for the Analyst, low for the Redliner, and `xHigh` for the Auditor.
+- **OpenAI mode:** set `USE_LOCAL_LLM=false`. Enrichment uses `gpt-4o-mini`; relevance, analysis, redlining, and audit use `gpt-5.6-luna` by default.
+- **Gemini workflow mode:** set `USE_LOCAL_LLM=false` and `USE_GEMINI=true`. Per-step thinking levels remain configurable in `src/legal_agent/config.py`.
+- **Local Legal Embeddings:** you can use `nlpaueb/legal-bert-base-uncased` instead of OpenAI embeddings by setting `USE_LEGAL_EMBEDDINGS=true`.
 
 ### Agent Routing
 
@@ -217,7 +240,7 @@ The current model routing is intentionally designed to optimize both cost and qu
 
 - `analyst`, `redliner`, and `auditor` steps require deep legal reasoning, so they are routed to stronger models (or higher thinking modes if using Gemini).
 - `relevance_check` acts as a fast filter and can safely use a cheaper, faster model.
-- `enrichment` can be routed to a lower-cost model or a locally hosted legal SLM (like Saul-7B) to save costs at scale.
+- `enrichment` runs with thinking disabled on the local Qwen model, or uses `gpt-4o-mini` in OpenAI mode.
 
 This separation keeps high-volume, cost-sensitive steps cheap while preserving top-tier quality where complex reasoning matters most.
 

@@ -4,11 +4,8 @@ Pipeline order
 --------------
     Docling → Chunking → per-chunk Enrichment → Embed → Upsert
 
-Enrichment uses MetadataEnrichmentPipeline(collection="policy") which selects
-_POLICY_ENRICHMENT_FEW_SHOT.  This prompt returns "department" as a scalar
-string (not "applies_to_departments" as a list).  The LLM also returns
-"policy_id" but that field is intentionally ignored — it is not stored in
-the Qdrant payload.
+Enrichment uses MetadataEnrichmentPipeline(collection="policy"), routed to the
+configured local llama.cpp, Gemini, or OpenAI provider.
 
 Payload schema (internal_policies collection)
 ---------------------------------------------
@@ -16,7 +13,8 @@ Payload schema (internal_policies collection)
     chunk_id, prev_chunk_id,
     next_chunk_id, chunk_index,
     chunk_count, token_count            chunk linkage / sequence integrity
-    document_hash                       document identity (content-based, no URL)
+    document_id, document_hash,
+    policy_id                           document identity
     department, topic_tags,
     compliance_domain, obligation_type  per-chunk enriched metadata
 """
@@ -48,6 +46,7 @@ _INTERNAL_SOURCE_PREFIX = "policy::"
 # ---------------------------------------------------------------------------
 # Public entry point
 # ---------------------------------------------------------------------------
+
 
 def ingest_policy_pdf(
     pdf_path: Path,
@@ -128,58 +127,41 @@ def ingest_policy_pdf(
     chunks = [dict(c) for c in chunks]
 
     if not chunks:
-        raise RuntimeError(
-            f"ChunkingPipeline produced no chunks from '{pdf_path.name}'."
-        )
+        raise RuntimeError(f"ChunkingPipeline produced no chunks from '{pdf_path.name}'.")
     logger.info("Chunking: produced %d chunks.", len(chunks))
 
     document_hash: str = chunks[0]["document_hash"]
-    
+
     # ------------------------------------------------------------------
     enrichment_pipeline = MetadataEnrichmentPipeline(collection="policy")
     enrichment_pipeline._settings = settings
-    if settings.use_legal_slm:
-        from legal_agent.scraping.pipelines import get_legal_slm
-        enrichment_pipeline._tokenizer, enrichment_pipeline._model = get_legal_slm(
-            settings.legal_slm_model,
-            settings.legal_slm_device,
-            settings.legal_slm_load_in_4bit,
-        )
-    elif settings.use_gemini:
-        meta = enrichment_pipeline._extract_with_gemini(enrichment_input)
-    else:
-        meta = enrichment_pipeline._extract_with_openai(enrichment_input)
 
     # Fetch the policy-schema defaults (department scalar, no applies_to_departments).
     defaults = enrichment_pipeline._get_defaults()
+    policy_id = pdf_path.stem
 
     for i, chunk in enumerate(chunks):
         header = chunk.get("header_path", "")
-        enrichment_input = (
-            f"[Section: {header}]\n\n{chunk['text']}" if header else chunk["text"]
-        )
-        enrichment_input = MetadataEnrichmentPipeline._prepare_enrichment_text(
-            enrichment_input
-        )
+        enrichment_input = f"[Section: {header}]\n\n{chunk['text']}" if header else chunk["text"]
+        enrichment_input = MetadataEnrichmentPipeline._prepare_enrichment_text(enrichment_input)
 
         try:
-            if settings.use_legal_slm:
-                meta = enrichment_pipeline._extract_with_slm(enrichment_input)
-            else:
-                meta = enrichment_pipeline._extract_with_openai(enrichment_input)
+            meta = enrichment_pipeline.extract_metadata(enrichment_input)
         except Exception:
             logger.warning(
                 "Per-chunk enrichment failed for chunk %d ('%s') – using defaults.",
-                i, header, exc_info=True,
+                i,
+                header,
+                exc_info=True,
             )
             meta = dict(defaults)
 
-        # Write only the four payload fields we keep.
-        # policy_id is present in meta but deliberately not read here.
+        # Keep normalized metadata and use the file stem as the stable policy ID.
         chunk["topic_tags"] = meta.get("topic_tags", defaults["topic_tags"])
         chunk["compliance_domain"] = meta.get("compliance_domain", defaults["compliance_domain"])
         chunk["department"] = meta.get("department", defaults["department"])
         chunk["obligation_type"] = meta.get("obligation_type", defaults["obligation_type"])
+        chunk["policy_id"] = policy_id
 
         # Hard overrides always win over LLM inference.
         if compliance_domain:
@@ -211,7 +193,7 @@ def ingest_policy_pdf(
             embed_inputs,
             settings,
             dense_name=settings.qdrant_policies_dense_name,  # "internal_policy"
-            sparse_name=settings.qdrant_sparse_name,          # "legal_clause"
+            sparse_name=settings.qdrant_sparse_name,  # "legal_clause"
         )
 
         points = [
@@ -223,8 +205,10 @@ def ingest_policy_pdf(
         total_upserted += len(points)
         logger.info(
             "Upserted batch %d–%d  (%d / %d total)",
-            batch_start, batch_start + len(batch) - 1,
-            total_upserted, len(chunks),
+            batch_start,
+            batch_start + len(batch) - 1,
+            total_upserted,
+            len(chunks),
         )
 
     logger.info("Ingestion complete: %d points → '%s'", total_upserted, collection)
@@ -235,6 +219,7 @@ def ingest_policy_pdf(
 # Internal helper
 # ---------------------------------------------------------------------------
 
+
 def _build_point(
     chunk: dict,
     named_vectors: Any,
@@ -243,8 +228,8 @@ def _build_point(
     """Construct a PointStruct with the minimal internal_policies payload."""
     chunk_index: int = chunk["chunk_index"]
     point_id = int(
-        hashlib.sha256(f"{document_hash}::{chunk_index}".encode()).hexdigest()[:15], 16
-    )
+        hashlib.sha256(f"{document_hash}::{chunk_index}".encode()).hexdigest()[:32], 16
+    ) % (2**63)
 
     return PointStruct(
         id=point_id,
@@ -261,7 +246,9 @@ def _build_point(
             "chunk_count": chunk["chunk_count"],
             "token_count": chunk.get("token_count", 0),
             # -- document identity --
+            "document_id": chunk["document_id"],
             "document_hash": document_hash,
+            "policy_id": chunk["policy_id"],
             # -- per-chunk enriched metadata --
             "department": chunk.get("department", "General"),
             "topic_tags": chunk.get("topic_tags", []),

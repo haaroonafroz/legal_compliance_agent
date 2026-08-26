@@ -16,9 +16,10 @@ DEFAULT_REQUEST_HEADERS = {
 
 ITEM_PIPELINES = {
     "legal_agent.scraping.pipelines.DoclingPdfPipeline": 100,
-    "legal_agent.scraping.pipelines.MetadataEnrichmentPipeline": 150,
-    "legal_agent.scraping.pipelines.ChunkingPipeline": 200,
-    "legal_agent.scraping.pipelines.QdrantPipeline": 300,
+    "legal_agent.scraping.pipelines.ContentValidationPipeline": 150,
+    "legal_agent.scraping.pipelines.MetadataEnrichmentPipeline": 200,
+    "legal_agent.scraping.pipelines.ChunkingPipeline": 250,
+    "legal_agent.scraping.pipelines.QdrantPipeline": 350,
 }
 
 LOG_LEVEL = "ERROR"

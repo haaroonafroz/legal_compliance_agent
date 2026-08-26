@@ -5,6 +5,8 @@ from legal_agent.workflow.events import FinalReportEvent, NewLawEvent, Retrieved
 
 def test_new_law_event_construction():
     ev = NewLawEvent(
+        document_id="reg-1",
+        document_hash="hash-1",
         regulation_text="Test regulation",
         header_path="Section 1 > Article 2",
         jurisdiction="EU",
@@ -18,6 +20,8 @@ def test_new_law_event_construction():
 
 def test_retrieved_context_event():
     law = NewLawEvent(
+        document_id="reg-2",
+        document_hash="hash-2",
         regulation_text="Test",
         header_path="",
         jurisdiction="California",
@@ -34,11 +38,14 @@ def test_retrieved_context_event():
 
 def test_final_report_event():
     ev = FinalReportEvent(
+        document_id="reg-3",
+        document_hash="hash-3",
         jurisdiction="EU",
         source_url="https://example.com",
         gap_analysis="Gaps found.",
         proposed_updates="Update section 3.",
         audit_notes="PASS – all clear.",
         passed=True,
+        status="approved",
     )
     assert ev.passed is True

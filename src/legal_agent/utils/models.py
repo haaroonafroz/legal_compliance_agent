@@ -20,38 +20,9 @@ def get_legal_embedder(model_name: str, device: str = "cuda"):
     return model
 
 
-@lru_cache(maxsize=1)
-def get_legal_slm(model_name: str, device: str = "cuda", load_in_4bit: bool = True):
-    """Load the legal SLM for metadata extraction."""
-    from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
-
-    logger.info("Loading legal SLM: %s (4-bit=%s)", model_name, load_in_4bit)
-    tokenizer = AutoTokenizer.from_pretrained(model_name)
-
-    if load_in_4bit:
-        bnb_config = BitsAndBytesConfig(
-            load_in_4bit=True,
-            bnb_4bit_compute_dtype="float16",
-            bnb_4bit_quant_type="nf4",
-        )
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            quantization_config=bnb_config,
-            device_map="auto",
-        )
-    else:
-        model = AutoModelForCausalLM.from_pretrained(
-            model_name,
-            torch_dtype="auto",
-            device_map="auto",
-        )
-
-    return tokenizer, model
-
-
 def embed_texts_legal(texts: list[str], settings: "Settings") -> list[list[float]]:
     """Embed a batch of texts using the legal embedding model."""
-    model = get_legal_embedder(settings.legal_embedding_model, settings.legal_slm_device)
+    model = get_legal_embedder(settings.legal_embedding_model, settings.legal_embedding_device)
     embeddings = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
     return embeddings.tolist()
 
@@ -61,7 +32,9 @@ def embed_texts_openai(texts: list[str], settings: "Settings") -> list[list[floa
     from openai import OpenAI
 
     client = OpenAI(api_key=settings.openai_api_key)
-    resp = client.embeddings.create(input=texts, model=settings.openai_embedding_model, dimensions=settings.openai_embedding_dim)
+    resp = client.embeddings.create(
+        input=texts, model=settings.openai_embedding_model, dimensions=settings.openai_embedding_dim
+    )
     return [d.embedding for d in resp.data]
 
 
@@ -71,17 +44,25 @@ def embed_texts(texts: list[str], settings: "Settings") -> list[list[float]]:
         return embed_texts_legal(texts, settings)
     return embed_texts_openai(texts, settings)
 
+
 @lru_cache(maxsize=1)
 def get_sparse_encoder(model_name: str):
     """Load the sparse BM25/SPLADE encoder once and cache it."""
     from fastembed import SparseTextEmbedding
+
     logger.info("Loading sparse embedding model: %s", model_name)
     return SparseTextEmbedding(model_name=model_name)
-def sparse_encode_texts(texts: list[str], settings: "Settings") -> list[tuple[list[int], list[float]]]:
+
+
+def sparse_encode_texts(
+    texts: list[str], settings: "Settings"
+) -> list[tuple[list[int], list[float]]]:
     """Return sparse vectors as (indices, values) tuples."""
     encoder = get_sparse_encoder(settings.sparse_embedding_model)
     results = list(encoder.embed(texts))
     return [(r.indices.tolist(), r.values.tolist()) for r in results]
+
+
 def compute_vectors(
     texts: list[str],
     settings: "Settings",
@@ -96,12 +77,15 @@ def compute_vectors(
     }
     """
     from qdrant_client.models import SparseVector
+
     dense_vectors = embed_texts(texts, settings)
     sparse_pairs = sparse_encode_texts(texts, settings)
     result = []
     for dense, (indices, values) in zip(dense_vectors, sparse_pairs):
-        result.append({
-            dense_name: dense,
-            sparse_name: SparseVector(indices=indices, values=values),
-        })
+        result.append(
+            {
+                dense_name: dense,
+                sparse_name: SparseVector(indices=indices, values=values),
+            }
+        )
     return result

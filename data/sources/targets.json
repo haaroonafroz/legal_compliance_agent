@@ -1,22 +1,33 @@
 [
   {
     "name": "EDPB - Compliance Monitoring",
+    "source_id": "edpb-publications",
+    "adapter": "edpb",
     "jurisdiction": "EU",
+    "feed_urls": [
+      "https://edpb.europa.eu/news/latest-publications/rss.xml"
+    ],
     "start_urls": [
-      "https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/guidelines_en",
-      "https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/recommendations_en",
-      "https://www.edpb.europa.eu/our-work-tools/our-documents/publication-type/opinions_en"
+      "https://www.edpb.europa.eu/home_en"
     ],
     "allowed_domains": ["edpb.europa.eu"],
+    "document_path_patterns": [
+      "/documents/",
+      "/our-work-tools/our-documents/",
+      "/public-consultations/",
+      "/system/files/"
+    ],
+    "document_types": ["guidelines", "recommendations", "opinions", "decisions"],
     "deny_patterns": [
       "/about-edpb/",
+      "/about-edpb_en/",
       "/careers/",
       "/contact/",
       "/news/",
       "/accountability-tools_en",
       "/newsfeed/"
     ],
-    "follow_links": true,
+    "follow_links": false,
     "follow_pdf": true,
     "max_depth": 3,
     "max_pages": 50,

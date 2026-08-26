@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 from typing import Any
 
+from llama_index.core.base.llms.types import ChatMessage, MessageRole
 from llama_index.core.workflow import (
     Context,
     StartEvent,
@@ -12,9 +13,6 @@ from llama_index.core.workflow import (
     Workflow,
     step,
 )
-from llama_index.llms.openai import OpenAI as LlamaOpenAI
-from llama_index.core.base.llms.types import ChatMessage, MessageRole
-from legal_agent.workflow.llm_provider import get_llm_for_step
 
 from legal_agent.config import Settings
 from legal_agent.db.client import client_from_settings
@@ -24,9 +22,10 @@ from legal_agent.workflow.events import (
     DraftCompleteEvent,
     FinalReportEvent,
     NewLawEvent,
-    RetrievedContextEvent,
     RelevantContextEvent,
+    RetrievedContextEvent,
 )
+from legal_agent.workflow.llm_provider import get_llm_for_step
 from legal_agent.workflow.prompts import (
     ANALYST_SYSTEM,
     ANALYST_USER,
@@ -42,12 +41,32 @@ logger = logging.getLogger(__name__)
 
 MAX_AUDIT_RETRIES = 2
 
+
 def _chat_messages(system: str, user: str) -> list[ChatMessage]:
     """Build a [system, user] ChatMessage list for ``llm.achat()``."""
     return [
         ChatMessage(role=MessageRole.SYSTEM, content=system),
         ChatMessage(role=MessageRole.USER, content=user),
     ]
+
+
+def _format_policy_evidence(policies: list[dict], *, max_chars: int = 12000) -> str:
+    text = "\n---\n".join(
+        (
+            f"Policy: {p.get('policy_id', 'N/A')} | "
+            f"Chunk: {p.get('chunk_id', 'N/A')} | "
+            f"Section: {p.get('header_path', 'N/A')} | "
+            f"Department: {p.get('department', 'N/A')}\n"
+            f"{p.get('text', '')}"
+        )
+        for p in policies
+    )
+    return (text or "_No matching policies found._")[:max_chars]
+
+
+def _policy_provenance(policies: list[dict]) -> list[dict]:
+    fields = ("policy_id", "document_id", "chunk_id", "header_path", "department")
+    return [{field: policy.get(field) for field in fields} for policy in policies]
 
 
 class ComplianceWorkflow(Workflow):
@@ -61,8 +80,6 @@ class ComplianceWorkflow(Workflow):
         self.llm_auditor = get_llm_for_step(settings, "auditor")
         self.llm_relevance_check = get_llm_for_step(settings, "relevance_check")
         self.qdrant = client_from_settings(settings)
-        from openai import OpenAI
-        self._openai = OpenAI(api_key=settings.openai_api_key)
 
     # ------------------------------------------------------------------
     # Step 1 – Horizon Scanner
@@ -73,17 +90,25 @@ class ComplianceWorkflow(Workflow):
         logger.info("Horizon Scanner: fetching unprocessed regulations…")
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-        results = self.qdrant.scroll(
-            collection_name=self.settings.qdrant_regulatory_collection,
-            scroll_filter=Filter(
-                must=[FieldCondition(key="is_processed", match=MatchValue(value=False))]
-            ),
-            limit=1000,
-            with_payload=True,
-            with_vectors=False,
+        pending_filter = Filter(
+            must=[FieldCondition(key="is_processed", match=MatchValue(value=False))],
+            must_not=[FieldCondition(key="is_current", match=MatchValue(value=False))],
         )
+        points = []
+        next_offset = None
+        while True:
+            page, next_offset = self.qdrant.scroll(
+                collection_name=self.settings.qdrant_regulatory_collection,
+                scroll_filter=pending_filter,
+                limit=256,
+                offset=next_offset,
+                with_payload=True,
+                with_vectors=False,
+            )
+            points.extend(page)
+            if next_offset is None:
+                break
 
-        points = results[0]
         if not points:
             logger.info("No unprocessed regulations found.")
             return StopEvent(result={"reports": []})
@@ -100,11 +125,6 @@ class ComplianceWorkflow(Workflow):
         if not grouped:
             logger.info("No valid unprocessed regulatory documents found.")
             return StopEvent(result={"reports": []})
-
-        reports = []
-        await ctx.store.set("reports", reports)
-        await ctx.store.set("grouped_keys", list(grouped.keys()))
-        await ctx.store.set("pending_count", len(grouped))
 
         for document_id, chunks in grouped.items():
             chunks.sort(key=lambda p: p.payload.get("chunk_index", 0))
@@ -146,6 +166,14 @@ class ComplianceWorkflow(Workflow):
                 compliance_domain=first.get("compliance_domain", ""),
                 applies_to_departments=first.get("applies_to_departments", []),
                 obligation_type=first.get("obligation_type", ""),
+                source_id=first.get("source_id", ""),
+                source_key=first.get("source_key", ""),
+                revision_id=first.get("revision_id", document_id),
+                document_type=first.get("document_type", ""),
+                published_at=first.get("published_at", ""),
+                legal_identifier=first.get("legal_identifier", ""),
+                language=first.get("language", ""),
+                is_current=first.get("is_current", True),
             )
 
         return StopEvent(result={"reports": []})
@@ -157,26 +185,29 @@ class ComplianceWorkflow(Workflow):
     async def librarian(self, ctx: Context, ev: NewLawEvent) -> RetrievedContextEvent:
         """Retrieve internal policies using hybrid search (dense + sparse)."""
         logger.info("Librarian: searching internal policies for '%s'…", ev.source_url)
-        from legal_agent.utils.models import embed_texts, sparse_encode_texts
         from qdrant_client.models import (
-            FieldCondition, Filter, FusionQuery, MatchAny, MatchValue,
-            Prefetch, SparseVector,
+            FieldCondition,
+            Filter,
+            FusionQuery,
+            MatchAny,
+            MatchValue,
+            Prefetch,
+            SparseVector,
         )
+
+        from legal_agent.utils.models import embed_texts, sparse_encode_texts
 
         domain = ev.compliance_domain
         tags = ev.topic_tags
         chunk_inputs = [
-            f"[{domain}] [{', '.join(tags)}] {chunk_text}"
-            for chunk_text in ev.regulation_chunks
+            f"[{domain}] [{', '.join(tags)}] {chunk_text}" for chunk_text in ev.regulation_chunks
         ]
         dense_vectors = embed_texts(chunk_inputs, self.settings)
         sparse_pairs = sparse_encode_texts(chunk_inputs, self.settings)
         # Build optional metadata filter
         filter_conditions = []
         if tags:
-            filter_conditions.append(
-                FieldCondition(key="topic_tags", match=MatchAny(any=tags))
-            )
+            filter_conditions.append(FieldCondition(key="topic_tags", match=MatchAny(any=tags)))
         if domain:
             filter_conditions.append(
                 FieldCondition(key="compliance_domain", match=MatchValue(value=domain))
@@ -215,7 +246,7 @@ class ComplianceWorkflow(Workflow):
         for hit in hits.points:
             matched_policies.append(hit.payload)
             scores.append(hit.score)
-        
+
         query_parts = []
         if ev.compliance_domain:
             query_parts.append(f"[{ev.compliance_domain}]")
@@ -230,9 +261,11 @@ class ComplianceWorkflow(Workflow):
             header = p.get("header_path", "")
             doc = f"[Section: {header}]\n\n{text}" if header else text
             documents.append(doc)
-        
+
+        reranker_used = False
         import voyageai
-        if self.settings.voyage_api_key and len(matched_policies) > 10:
+
+        if self.settings.voyage_api_key and len(matched_policies) > 5:
             vo = voyageai.Client(api_key=self.settings.voyage_api_key)
             reranking = vo.rerank(
                 query=rerank_query,
@@ -244,22 +277,25 @@ class ComplianceWorkflow(Workflow):
             # Reorder by rerank results (results are sorted by relevance, descending)
             indices = [r.index for r in reranking.results]
             matched_policies = [matched_policies[i] for i in indices]
-            scores = [scores[i] for i in indices]
-        elif len(matched_policies) > 10:
-            # No reranker: take top 10 by original RRF score
+            scores = [r.relevance_score for r in reranking.results]
+            reranker_used = True
+        elif matched_policies:
+            # No reranker: keep a consistent top-five evidence set.
             matched_policies = matched_policies[:5]
             scores = scores[:5]
 
-        
         await ctx.store.set("matched_policies", matched_policies)
         await ctx.store.set("retrieval_scores", scores)
+        await ctx.store.set("reranker_used", reranker_used)
 
         logger.info("Librarian: found %d matching policies.", len(matched_policies))
         return RetrievedContextEvent(
             regulation=ev,
             matched_policies=matched_policies,
             retrieval_scores=scores,
+            reranker_used=reranker_used,
         )
+
     # ------------------------------------------------------------------
     # Step Intermediate – Relevance check
     # ------------------------------------------------------------------
@@ -268,7 +304,7 @@ class ComplianceWorkflow(Workflow):
         self, ctx: Context, ev: RetrievedContextEvent
     ) -> RelevantContextEvent | StopEvent:
         """Determine if the regulation is relevant or noise."""
-        
+
         logger.info(
             "Relevance check: checking '%s'…",
             ev.regulation.source_url,
@@ -281,14 +317,17 @@ class ComplianceWorkflow(Workflow):
         )
         decision = response.message.content.strip().upper()
 
-        if decision.startswith("IRRELEVANT"):
+        if decision not in {"RELEVANT", "IRRELEVANT"}:
+            raise ValueError(f"Unexpected relevance decision: {decision!r}")
+
+        if decision == "IRRELEVANT":
             logger.info("Document marked as IRRELEVANT. Stopping workflow and starting again.")
 
             from qdrant_client.models import FieldCondition, Filter, MatchValue
-            # ✅ mark as processed
+
             self.qdrant.set_payload(
                 collection_name=self.settings.qdrant_regulatory_collection,
-                payload={"is_processed": True},
+                payload={"is_processed": True, "workflow_status": "irrelevant"},
                 points=Filter(
                     must=[
                         FieldCondition(
@@ -298,23 +337,34 @@ class ComplianceWorkflow(Workflow):
                     ]
                 ),
             )
-            # ✅ stop workflow early
             return StopEvent(
                 result={
                     "document_id": ev.regulation.document_id,
+                    "document_hash": ev.regulation.document_hash,
+                    "jurisdiction": ev.regulation.jurisdiction,
+                    "source_url": ev.regulation.source_url,
+                    "source_id": ev.regulation.source_id,
+                    "source_key": ev.regulation.source_key,
+                    "revision_id": ev.regulation.revision_id,
+                    "document_type": ev.regulation.document_type,
+                    "published_at": ev.regulation.published_at,
+                    "legal_identifier": ev.regulation.legal_identifier,
+                    "language": ev.regulation.language,
+                    "is_current": ev.regulation.is_current,
+                    "status": "irrelevant",
                     "skipped": True,
                     "reason": "irrelevant",
                 }
             )
-        # -----------------------------
-        # ✅ RELEVANT → CONTINUE FLOW
-        # -----------------------------
+
         logger.info("Document is RELEVANT. Continuing workflow.")
         return RelevantContextEvent(
             regulation=ev.regulation,
             matched_policies=ev.matched_policies,
             retrieval_scores=ev.retrieval_scores,
+            reranker_used=ev.reranker_used,
         )
+
     # ------------------------------------------------------------------
     # Step 3 – Analyst (gap analysis)
     # ------------------------------------------------------------------
@@ -323,10 +373,7 @@ class ComplianceWorkflow(Workflow):
         """Compare regulation against internal policies and produce gap analysis."""
         logger.info("Analyst: generating gap analysis for '%s'…", ev.regulation.source_url)
 
-        policies_text = "\n---\n".join(
-            f"**Policy:** {p.get('policy_id', 'N/A')} (Dept: {p.get('department', 'N/A')})\n{p.get('text', '')}"
-            for p in ev.matched_policies
-        ) or "_No matching policies found._"
+        policies_text = _format_policy_evidence(ev.matched_policies, max_chars=6000)
 
         prompt = ANALYST_USER.format(
             jurisdiction=ev.regulation.jurisdiction,
@@ -379,18 +426,35 @@ class ComplianceWorkflow(Workflow):
     async def auditor(
         self, ctx: Context, ev: DraftCompleteEvent | AuditResultEvent
     ) -> FinalReportEvent | AnalysisCompleteEvent | AuditResultEvent:
-        """Review outputs for hallucinations. Retry via Analyst if audit fails."""
+        """Review outputs for hallucinations and return failed drafts to the Redliner."""
         if isinstance(ev, AuditResultEvent):
             retries = await ctx.store.get("audit_retries", default=0)
             if ev.passed or retries >= MAX_AUDIT_RETRIES:
+                matched_policies = await ctx.store.get("matched_policies", default=[])
+                retrieval_scores = await ctx.store.get("retrieval_scores", default=[])
+                reranker_used = await ctx.store.get("reranker_used", default=False)
                 return FinalReportEvent(
                     document_id=ev.regulation.document_id,
+                    document_hash=ev.regulation.document_hash,
                     jurisdiction=ev.regulation.jurisdiction,
                     source_url=ev.regulation.source_url,
                     gap_analysis=ev.gap_analysis,
                     proposed_updates=ev.proposed_updates,
                     audit_notes=ev.audit_notes,
                     passed=ev.passed,
+                    status="approved" if ev.passed else "review_required",
+                    matched_policies=_policy_provenance(matched_policies),
+                    retrieval_scores=retrieval_scores,
+                    reranker_used=reranker_used,
+                    audit_retries=retries,
+                    source_id=ev.regulation.source_id,
+                    source_key=ev.regulation.source_key,
+                    revision_id=ev.regulation.revision_id,
+                    document_type=ev.regulation.document_type,
+                    published_at=ev.regulation.published_at,
+                    legal_identifier=ev.regulation.legal_identifier,
+                    language=ev.regulation.language,
+                    is_current=ev.regulation.is_current,
                 )
             logger.warning("Audit FAILED (retry %d) – sending back to the Redliner.", retries + 1)
             await ctx.store.set("audit_retries", retries + 1)
@@ -403,14 +467,17 @@ class ComplianceWorkflow(Workflow):
             )
 
         logger.info("Auditor: reviewing outputs for '%s'…", ev.regulation.source_url)
+        matched_policies = await ctx.store.get("matched_policies", default=[])
         prompt = AUDITOR_USER.format(
+            regulation_text=ev.regulation.regulation_text[:12000],
+            policies_text=_format_policy_evidence(matched_policies),
             gap_analysis=ev.gap_analysis[:6000],
             proposed_updates=ev.proposed_updates[:6000],
         )
 
         response = await self.llm_auditor.achat(messages=_chat_messages(AUDITOR_SYSTEM, prompt))
 
-        passed = response.message.content.strip().upper().startswith("PASS")
+        passed = response.message.content.strip().upper() == "PASS"
 
         audit_ev = AuditResultEvent(
             regulation=ev.regulation,
@@ -426,14 +493,14 @@ class ComplianceWorkflow(Workflow):
     # ------------------------------------------------------------------
     @step
     async def collect_report(self, ctx: Context, ev: FinalReportEvent) -> StopEvent:
-        """Mark regulation as processed in Qdrant and emit the final report."""
+        """Finalize workflow state and emit a provenance-bearing report."""
         logger.info("Report ready for '%s' (passed=%s).", ev.source_url, ev.passed)
 
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
         self.qdrant.set_payload(
             collection_name=self.settings.qdrant_regulatory_collection,
-            payload={"is_processed": True},
+            payload={"is_processed": True, "workflow_status": ev.status},
             points=Filter(
                 must=[FieldCondition(key="document_id", match=MatchValue(value=ev.document_id))]
             ),
@@ -442,11 +509,25 @@ class ComplianceWorkflow(Workflow):
         return StopEvent(
             result={
                 "document_id": ev.document_id,
+                "document_hash": ev.document_hash,
                 "jurisdiction": ev.jurisdiction,
                 "source_url": ev.source_url,
+                "source_id": ev.source_id,
+                "source_key": ev.source_key,
+                "revision_id": ev.revision_id,
+                "document_type": ev.document_type,
+                "published_at": ev.published_at,
+                "legal_identifier": ev.legal_identifier,
+                "language": ev.language,
+                "is_current": ev.is_current,
+                "status": ev.status,
                 "gap_analysis": ev.gap_analysis,
                 "proposed_updates": ev.proposed_updates,
                 "audit_notes": ev.audit_notes,
                 "passed": ev.passed,
+                "matched_policies": ev.matched_policies,
+                "retrieval_scores": ev.retrieval_scores,
+                "reranker_used": ev.reranker_used,
+                "audit_retries": ev.audit_retries,
             }
         )
