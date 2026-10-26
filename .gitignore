@@ -14,3 +14,4 @@ data/reports/
 :memory:.ses
 cluster_definition.txt
 *langfuse-local*
+*.sqlite3
