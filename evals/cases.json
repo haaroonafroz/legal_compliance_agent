@@ -1,0 +1,20 @@
+[
+  {
+    "id": "notification-covered",
+    "regulation_quote": "The controller shall notify the authority within 72 hours of becoming aware of a breach.",
+    "policy_text": "The privacy team must notify the authority within 72 hours after becoming aware of a breach.",
+    "expected_outcome": "covered"
+  },
+  {
+    "id": "notification-deadline-gap",
+    "regulation_quote": "The controller shall notify the authority within 72 hours of becoming aware of a breach.",
+    "policy_text": "The privacy team must notify the authority within seven days after becoming aware of a breach.",
+    "expected_outcome": "gap"
+  },
+  {
+    "id": "notification-uncertain",
+    "regulation_quote": "The controller shall notify the authority within 72 hours of becoming aware of a breach.",
+    "policy_text": "The privacy team should notify the authority promptly after a breach.",
+    "expected_outcome": "uncertain"
+  }
+]

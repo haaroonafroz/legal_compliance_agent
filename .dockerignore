@@ -1,0 +1,13 @@
+.git
+.github
+.venv
+.env
+.pytest_cache
+.ruff_cache
+__pycache__
+*.pyc
+*.pdf
+data/state
+data/reports
+data/quarantine
+langfuse-local

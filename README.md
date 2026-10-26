@@ -2,26 +2,32 @@
 
 A tool to help legal teams track new laws and update company rules.
 
-The agent finds new rules online. It checks them against your company rules. Then, it tells you what needs to change.
+The agent finds new regulatory material online and compares extracted obligations with
+written company policies. Its reports are draft policy-coverage assessments for human
+review; they do not establish that operational controls work or that the organisation
+is legally compliant.
 
 ## How It Works
 
-The agent runs in five clear steps:
+The process has seven steps:
 
 1. **Scrape:** It finds new laws on the web.
-2. **Retrieve:** It finds your company rules that match the new law.
-3. **Analyze:** It spots the gaps between the law and your rules.
-4. **Draft:** It writes text to fix your rules.
-5. **Audit:** It checks its own work for mistakes.
+2. **Extract:** It identifies quoted obligations in every source chunk.
+3. **Retrieve:** It finds candidate policy text for each obligation.
+4. **Analyze:** It assesses written policy coverage for each obligation.
+5. **Draft:** It proposes text for identified policy gaps.
+6. **Model audit:** It checks the draft for inconsistencies.
+7. **Human review:** A person decides whether to approve or reject the report.
 
 Workflow steps (Agents):
 
 1. `Horizon Scanner`: groups unprocessed regulation chunks back into complete documents.
-2. `Librarian`: runs hybrid retrieval against internal policies.
-3. `Relevance Check`: filters out site noise and non-regulatory content.
-4. `Analyst`: compares regulation text against internal policy text.
-5. `Redliner`: drafts policy amendments in redline form.
-6. `Auditor`: checks for hallucinations, weak reasoning, and draft mismatch before finalizing.
+2. `Obligation Extractor`: returns source-quoted duties for each document chunk.
+3. `Librarian`: runs hybrid retrieval against internal policies per obligation.
+4. `Relevance Check`: filters out site noise and non-regulatory content.
+5. `Analyst`: assesses policy coverage with validated source and policy citations.
+6. `Redliner`: drafts policy amendments in redline form.
+7. `Auditor`: checks for hallucinations, weak reasoning, and draft mismatch before review.
 
 ## Tools in Use
 
@@ -42,10 +48,12 @@ Scrapy Spider ──► Qdrant (regulatory_updates)
                           │
           ComplianceWorkflow (LlamaIndex)
           ┌─────────┼─────────────────────┐
-    Horizon     Librarian        Analyst
-    Scanner   (RAG retrieval)  (gap analysis)
-                                     │
-                              Redliner ──► Auditor ──► Report
+    Horizon ──► Obligation ──► Librarian ──► Analyst
+    Scanner      Extractor     (RAG retrieval)  (coverage)
+                                                │
+                                     Redliner ──► Model audit
+                                                    │
+                                             Report ──► Human review
 ```
 
 ## Quick Start
@@ -118,8 +126,24 @@ Start the main job.
 legal-agent run-workflow
 ```
 
-The agent processes all complete, pending regulatory documents and saves one report per
-document in the `data/reports/` folder.
+The agent processes all complete, pending regulatory documents and saves one JSON and
+one Markdown report per document in `data/reports/`. It saves both files before marking
+the document processed in Qdrant. A model audit pass produces `pending_human_review`.
+
+### 7. Record a human decision
+
+Inspect the source, policy citations, proposed changes, and model audit notes in the
+report. Then record a decision with a reviewer identity and rationale:
+
+```bash
+legal-agent review-report data/reports/<report-name>.md \
+  --decision approve --reviewer "your-name" --reason "Reviewed source and policy evidence"
+```
+
+`approve` is allowed only for `pending_human_review`. A reviewer can `reject` a report
+that is pending review or marked `review_required`. The decision and timestamp are
+written to both report formats and reflected in Qdrant. The command does not edit an
+internal policy or implement a control.
 
 ## CLI Commands
 
@@ -130,6 +154,7 @@ document in the `data/reports/` folder.
 | `legal-agent scrape`            | Finds new laws on the web.             |
 | `legal-agent retry-dead-letters` | Requeues failed acquisitions for retry. |
 | `legal-agent run-workflow`      | Runs the main agent task.              |
+| `legal-agent review-report`     | Records a human approval or rejection. |
 | `legal-agent load-policies-pdf` | Loads a PDF policy into the database.  |
 | `legal-agent status`            | Shows how many laws are left to check. |
 
@@ -180,6 +205,7 @@ This repo sends OTEL traces to Phoenix at `PHOENIX_ENDPOINT` (HTTP OTLP path `/v
   - `PHOENIX_ENDPOINT=http://localhost:6006`
   - `PHOENIX_EXTERNAL=false`
    When `localhost` is in the URL and `PHOENIX_EXTERNAL` is false, `phoenix.launch_app()` can start the server for you during `run-workflow`.
+   Install the optional local server first with `pip install -e '.[phoenix]'`.
 2. Open `http://localhost:6006` for the Phoenix UI.
 
 ### Run the workflow with tracing on
@@ -221,24 +247,100 @@ content revisions. Unchanged revisions are skipped, while changed revisions
 supersede older ones. Conversion, model, and persistence failures become
 dead-lettered records that can be requeued with `legal-agent retry-dead-letters`.
 
-Regulatory documents move from `pending` to `approved`, `review_required`, or
-`irrelevant`. A failed final audit is retained as `review_required`; it is not silently
-treated as an approved compliance result.
+Regulatory documents move from `pending` to `pending_human_review`, `review_required`,
+or `irrelevant`. Only an explicit `review-report --decision approve` transition marks
+a document `approved`. Extraction failures, unsupported assessments, uncertain policy
+coverage, weak retrieval, and failed model audits require review. No model output alone
+can approve a report.
 
 ## Obligation-centric workflow
 
-`legal-agent run-workflow` first extracts atomic duties, prohibitions, deadlines, and
-conditional requirements from each relevant regulation. The Librarian then runs a
+`legal-agent run-workflow` extracts duties, prohibitions, deadlines, and conditional
+requirements from every source chunk. Malformed extraction or an empty result requires
+review. The Librarian then runs a
 separate dense+sparse policy search for every obligation, expands adjacent policy
 chunks, and optionally reranks the evidence. The Analyst and Auditor receive this
 obligation-to-evidence mapping, rather than one undifferentiated policy bundle.
 
-The evidence gate requires each obligation to meet the configured minimum hit and
-score thresholds. Documents that fail the gate become `review_required` and do not
-produce automatic gap analysis or redlines. Tune the bounded retrieval loop with
+The retrieval gate requires each obligation to have candidate policy evidence meeting
+the configured hit and score thresholds. This gate measures retrieval availability,
+not legal sufficiency. Documents that fail it become `review_required` and do not
+produce automatic gap analysis or redlines. The Analyst then returns one structured
+policy-coverage assessment for each obligation. The code checks obligation IDs and
+verbatim source and policy citations; malformed, missing, or uncertain assessments
+also require review. Tune the bounded retrieval loop with
 `OBLIGATION_RETRIEVAL_TOP_K`, `OBLIGATION_RETRIEVAL_FINAL_K`,
 `OBLIGATION_MIN_EVIDENCE_HITS`, `OBLIGATION_MIN_RETRIEVAL_SCORE`, and
 `OBLIGATION_NEIGHBOR_HOPS`.
+
+## Container architecture and run
+
+The Dockerfile builds one Python image with the CLI, workflow, scraping code, and
+dependencies. The default command starts a batch workflow; the same image can run
+`init-db`, `load-policies-pdf`, `scrape`, or `review-report` by overriding the command.
+
+```mermaid
+flowchart LR
+    Dockerfile --> Image[Image: Python 3.12 slim, OS libraries, CPU PyTorch, Python package, source targets]
+    Env[.env / runtime secrets] --> CLI
+    Image --> CLI
+    subgraph Container[Single batch-job container]
+        CLI[legal-agent CLI]
+        CLI --> Scrape[scrape]
+        CLI --> Load[load-policies-pdf]
+        CLI --> Workflow[run-workflow]
+        CLI --> Review[review-report]
+        Workflow --> Extract[Obligation extraction]
+        Extract --> Retrieve[Policy retrieval]
+        Retrieve --> Assess[Assessment, redline, model audit]
+        Assess --> Report[JSON + Markdown report]
+    end
+    Web[Regulatory websites] --> Scrape
+    PDFs[Policy PDFs] --> Load
+    Scrape --> Regs[(Qdrant: regulatory_updates)]
+    Load --> Policies[(Qdrant: internal_policies)]
+    Regs --> Workflow
+    Policies --> Retrieve
+    Report --> Data[(Mounted data/: reports, SQLite manifest, policies)]
+    Data --> Review
+    Review --> Regs
+    Scrape --> Data
+    Scrape --> Models
+    Load --> Models
+    Extract --> Models[External LLM and embedding APIs]
+    Retrieve --> Models
+    Assess --> Models
+    Container --> Traces[Optional tracing services]
+    Human[Human reviewer] --> Review
+```
+
+No queue, scheduler, API server, or multi-container deployment is included yet.
+The container exits when its command finishes. Keep `data/` on durable storage so
+reports and the SQLite acquisition manifest survive container replacement. Qdrant,
+model endpoints, and optional tracing services must be reachable from the container.
+Running multiple copies later will require shared report/manifest storage and a way
+to claim work so two workers do not process the same document.
+
+Build and run the workflow manually:
+
+```bash
+docker build -t legal-agent .
+docker run --rm --env-file .env \
+  -e QDRANT_URL=https://your-qdrant-host \
+  -v "$PWD/data:/app/data" legal-agent legal-agent run-workflow
+```
+
+The image defaults to hosted LLM mode; configure the provider keys in `.env`.
+The Docker image uses the CPU PyTorch wheels described in the
+[PyTorch installation guide](https://pytorch.org/get-started/previous-versions/).
+Deployment to a cloud account still requires environment-specific infrastructure
+and credentials.
+
+The three synthetic cases in `evals/cases.json` check the Analyst's policy-coverage
+outcomes against labeled expectations. With a configured model, run
+`python evals/run_analyst_eval.py`. This is a small prompt check, not a legal-quality
+benchmark; expand it with reviewed examples and retrieval/end-to-end cases before
+relying on model performance claims.
 
 ## LLM and Embedding Model choices
 

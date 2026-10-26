@@ -11,5 +11,6 @@ data/reports/
 *.pdf
 .ruff_cache/
 .pytest_cache/
+:memory:.ses
 cluster_definition.txt
 *langfuse-local*

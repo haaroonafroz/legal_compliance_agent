@@ -30,3 +30,33 @@ def test_report_includes_workflow_and_retrieval_provenance():
     assert "POL-1" in rendered
     assert "0.9100" in rendered
     assert "Reranker Used | True" in rendered
+
+
+def test_review_required_markdown_exposes_obligation_evidence():
+    rendered = _render_markdown(
+        {
+            "document_id": "doc-1",
+            "status": "review_required",
+            "skipped": True,
+            "reason": "uncertain_policy_coverage",
+            "obligation_evidence": [
+                {
+                    "obligation_id": "obligation-1",
+                    "obligation": {"quote": "The controller shall notify."},
+                    "sufficient": True,
+                    "matched_policies": [{"chunk_id": "policy-1"}],
+                }
+            ],
+            "assessments": [
+                {
+                    "obligation_id": "obligation-1",
+                    "outcome": "uncertain",
+                    "explanation": "Deadline missing from policy",
+                }
+            ],
+        }
+    )
+    assert "uncertain_policy_coverage" in rendered
+    assert "policy-1" in rendered
+    assert "Deadline missing from policy" in rendered
+    assert "NOT RUN" in rendered

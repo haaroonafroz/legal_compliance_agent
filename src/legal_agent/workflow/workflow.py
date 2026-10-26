@@ -16,6 +16,7 @@ from llama_index.core.workflow import (
 
 from legal_agent.config import Settings
 from legal_agent.db.client import client_from_settings
+from legal_agent.utils.assessments import parse_assessments, render_assessments
 from legal_agent.utils.obligations import (
     LegalObligation,
     ObligationEvidence,
@@ -78,8 +79,30 @@ def _policy_provenance(policies: list[dict]) -> list[dict]:
     return [{field: policy.get(field) for field in fields} for policy in policies]
 
 
+def _stopped_result(regulation: NewLawEvent, status: str, reason: str, **details: Any) -> dict:
+    """Build a reportable result without changing durable document state."""
+    return {
+        "document_id": regulation.document_id,
+        "document_hash": regulation.document_hash,
+        "jurisdiction": regulation.jurisdiction,
+        "source_url": regulation.source_url,
+        "source_id": regulation.source_id,
+        "source_key": regulation.source_key,
+        "revision_id": regulation.revision_id,
+        "document_type": regulation.document_type,
+        "published_at": regulation.published_at,
+        "legal_identifier": regulation.legal_identifier,
+        "language": regulation.language,
+        "is_current": regulation.is_current,
+        "status": status,
+        "skipped": True,
+        "reason": reason,
+        **details,
+    }
+
+
 def _format_obligation_evidence(
-    evidence_bundles: list[dict], *, max_chars: int = 12000
+    evidence_bundles: list[dict], *, max_chars: int = 12000, per_obligation_chars: int = 4000
 ) -> str:
     """Format evidence grouped by obligation for analyst and auditor prompts."""
     sections = []
@@ -94,7 +117,7 @@ def _format_obligation_evidence(
         ]
         if bundle.get("insufficiency_reason"):
             lines.append(f"Evidence note: {bundle['insufficiency_reason']}")
-        lines.append(_format_policy_evidence(evidence, max_chars=4000))
+        lines.append(_format_policy_evidence(evidence, max_chars=per_obligation_chars))
         sections.append("\n".join(lines))
     return "\n\n---\n\n".join(sections)[:max_chars] or "_No obligation evidence found._"
 
@@ -214,20 +237,39 @@ class ComplianceWorkflow(Workflow):
     @step
     async def obligation_extractor(
         self, ctx: Context, ev: NewLawEvent
-    ) -> ObligationsExtractedEvent:
-        """Extract atomic obligations once before running focused retrieval."""
+    ) -> ObligationsExtractedEvent | StopEvent:
+        """Extract across every source chunk; incomplete extraction requires review."""
         logger.info("Obligation Extractor: decomposing '%s'…", ev.source_url)
-        prompt = OBLIGATION_EXTRACTOR_USER.format(
-            regulation_text=ev.regulation_text[:16000],
-        )
-        response = await self.llm_analyst.achat(
-            messages=_chat_messages(OBLIGATION_EXTRACTOR_SYSTEM, prompt)
-        )
-        obligations = parse_obligations(
-            response.message.content,
-            ev.regulation_text,
-            maximum=self.settings.obligation_extraction_max,
-        )
+        obligations: list[LegalObligation] = []
+        seen_quotes: set[str] = set()
+        chunks = ev.regulation_chunks or [ev.regulation_text]
+        try:
+            for chunk in chunks:
+                response = await self.llm_analyst.achat(
+                    messages=_chat_messages(
+                        OBLIGATION_EXTRACTOR_SYSTEM,
+                        OBLIGATION_EXTRACTOR_USER.format(regulation_text=chunk),
+                    )
+                )
+                extracted = parse_obligations(
+                    response.message.content,
+                    chunk,
+                    maximum=self.settings.obligation_extraction_max,
+                    strict=True,
+                )
+                for obligation in extracted:
+                    if obligation.quote not in seen_quotes:
+                        seen_quotes.add(obligation.quote)
+                        obligations.append(
+                            obligation.model_copy(
+                                update={"obligation_id": f"obligation-{len(obligations) + 1}"}
+                            )
+                        )
+            if not obligations:
+                raise ValueError("No obligations were extracted from the document")
+        except ValueError as exc:
+            logger.warning("Obligation extraction needs review: %s", exc)
+            return StopEvent(result=_stopped_result(ev, "review_required", str(exc)))
         await ctx.store.set("obligations", [obligation.model_dump() for obligation in obligations])
         logger.info("Obligation Extractor: found %d obligations.", len(obligations))
         return ObligationsExtractedEvent(regulation=ev, obligations=obligations)
@@ -254,14 +296,7 @@ class ComplianceWorkflow(Workflow):
         from legal_agent.utils.models import embed_texts, sparse_encode_texts
 
         regulation = ev.regulation
-        obligations = ev.obligations or [
-            LegalObligation(
-                obligation_id="obligation-1",
-                quote=regulation.regulation_text[:1000],
-                action="Comply with the stated requirement",
-                confidence=0.0,
-            )
-        ]
+        obligations = ev.obligations
         query_texts = [obligation_query(obligation) for obligation in obligations]
         dense_vectors = embed_texts(query_texts, self.settings)
         sparse_pairs = sparse_encode_texts(query_texts, self.settings)
@@ -488,77 +523,18 @@ class ComplianceWorkflow(Workflow):
 
         if decision == "IRRELEVANT":
             logger.info("Document marked as IRRELEVANT. Stopping workflow and starting again.")
-
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-            self.qdrant.set_payload(
-                collection_name=self.settings.qdrant_regulatory_collection,
-                payload={"is_processed": True, "workflow_status": "irrelevant"},
-                points=Filter(
-                    must=[
-                        FieldCondition(
-                            key="document_id",
-                            match=MatchValue(value=ev.regulation.document_id),
-                        )
-                    ]
-                ),
-            )
-            return StopEvent(
-                result={
-                    "document_id": ev.regulation.document_id,
-                    "document_hash": ev.regulation.document_hash,
-                    "jurisdiction": ev.regulation.jurisdiction,
-                    "source_url": ev.regulation.source_url,
-                    "source_id": ev.regulation.source_id,
-                    "source_key": ev.regulation.source_key,
-                    "revision_id": ev.regulation.revision_id,
-                    "document_type": ev.regulation.document_type,
-                    "published_at": ev.regulation.published_at,
-                    "legal_identifier": ev.regulation.legal_identifier,
-                    "language": ev.regulation.language,
-                    "is_current": ev.regulation.is_current,
-                    "status": "irrelevant",
-                    "skipped": True,
-                    "reason": "irrelevant",
-                }
-            )
+            return StopEvent(result=_stopped_result(ev.regulation, "irrelevant", "irrelevant"))
 
         logger.info("Document is RELEVANT. Continuing workflow.")
         if any(not bundle.get("sufficient", False) for bundle in ev.obligation_evidence):
             logger.warning("Evidence gate failed for '%s'.", ev.regulation.source_url)
-            from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-            self.qdrant.set_payload(
-                collection_name=self.settings.qdrant_regulatory_collection,
-                payload={"is_processed": True, "workflow_status": "review_required"},
-                points=Filter(
-                    must=[
-                        FieldCondition(
-                            key="document_id",
-                            match=MatchValue(value=ev.regulation.document_id),
-                        )
-                    ]
-                ),
-            )
             return StopEvent(
-                result={
-                    "document_id": ev.regulation.document_id,
-                    "document_hash": ev.regulation.document_hash,
-                    "jurisdiction": ev.regulation.jurisdiction,
-                    "source_url": ev.regulation.source_url,
-                    "source_id": ev.regulation.source_id,
-                    "source_key": ev.regulation.source_key,
-                    "revision_id": ev.regulation.revision_id,
-                    "document_type": ev.regulation.document_type,
-                    "published_at": ev.regulation.published_at,
-                    "legal_identifier": ev.regulation.legal_identifier,
-                    "language": ev.regulation.language,
-                    "is_current": ev.regulation.is_current,
-                    "status": "review_required",
-                    "skipped": True,
-                    "reason": "insufficient_evidence",
-                    "obligation_evidence": ev.obligation_evidence,
-                }
+                result=_stopped_result(
+                    ev.regulation,
+                    "review_required",
+                    "insufficient_evidence",
+                    obligation_evidence=ev.obligation_evidence,
+                )
             )
         return RelevantContextEvent(
             regulation=ev.regulation,
@@ -572,31 +548,58 @@ class ComplianceWorkflow(Workflow):
     # Step 3 – Analyst (gap analysis)
     # ------------------------------------------------------------------
     @step
-    async def analyst(self, ctx: Context, ev: RelevantContextEvent) -> AnalysisCompleteEvent:
-        """Compare regulation against internal policies and produce gap analysis."""
+    async def analyst(
+        self, ctx: Context, ev: RelevantContextEvent
+    ) -> AnalysisCompleteEvent | StopEvent:
+        """Assess every obligation and validate citations before drafting."""
         logger.info("Analyst: generating gap analysis for '%s'…", ev.regulation.source_url)
+        assessments = []
+        try:
+            for bundle in ev.obligation_evidence:
+                prompt = ANALYST_USER.format(
+                    jurisdiction=ev.regulation.jurisdiction,
+                    source_url=ev.regulation.source_url,
+                    effective_date=ev.regulation.effective_date,
+                    regulation_text=bundle["obligation"]["quote"],
+                    policies_text=_format_policy_evidence(
+                        bundle["matched_policies"], max_chars=40000
+                    ),
+                    obligation_evidence=_format_obligation_evidence(
+                        [bundle], max_chars=40000, per_obligation_chars=40000
+                    ),
+                )
+                response = await self.llm_analyst.achat(
+                    messages=_chat_messages(ANALYST_SYSTEM, prompt)
+                )
+                assessments.extend(parse_assessments(response.message.content, [bundle]))
+        except ValueError as exc:
+            logger.warning("Analysis needs review: %s", exc)
+            return StopEvent(
+                result=_stopped_result(
+                    ev.regulation,
+                    "review_required",
+                    f"invalid_analysis: {exc}",
+                    obligation_evidence=ev.obligation_evidence,
+                )
+            )
 
-        policies_text = _format_policy_evidence(ev.matched_policies, max_chars=6000)
-        obligation_evidence = _format_obligation_evidence(
-            ev.obligation_evidence,
-            max_chars=10000,
-        )
-
-        prompt = ANALYST_USER.format(
-            jurisdiction=ev.regulation.jurisdiction,
-            source_url=ev.regulation.source_url,
-            effective_date=ev.regulation.effective_date,
-            regulation_text=ev.regulation.regulation_text[:6000],
-            policies_text=policies_text[:6000],
-            obligation_evidence=obligation_evidence,
-        )
-
-        response = await self.llm_analyst.achat(messages=_chat_messages(ANALYST_SYSTEM, prompt))
+        await ctx.store.set("assessments", [assessment.model_dump() for assessment in assessments])
+        await ctx.store.set("has_gaps", any(item.outcome == "gap" for item in assessments))
+        if any(item.outcome == "uncertain" for item in assessments):
+            return StopEvent(
+                result=_stopped_result(
+                    ev.regulation,
+                    "review_required",
+                    "uncertain_policy_coverage",
+                    obligation_evidence=ev.obligation_evidence,
+                    assessments=[assessment.model_dump() for assessment in assessments],
+                )
+            )
 
         return AnalysisCompleteEvent(
             regulation=ev.regulation,
             matched_policies=ev.matched_policies,
-            gap_analysis=response.message.content,
+            gap_analysis=render_assessments(assessments),
             obligation_evidence=ev.obligation_evidence,
         )
 
@@ -607,17 +610,23 @@ class ComplianceWorkflow(Workflow):
     async def redliner(self, ctx: Context, ev: AnalysisCompleteEvent) -> DraftCompleteEvent:
         """Draft policy amendments to close identified gaps."""
         logger.info("Redliner: drafting amendments for '%s'…", ev.regulation.source_url)
+        if not await ctx.store.get("has_gaps", default=True):
+            return DraftCompleteEvent(
+                regulation=ev.regulation,
+                gap_analysis=ev.gap_analysis,
+                proposed_updates="No policy gaps identified; human review is still required.",
+            )
         audit_feedback = ""
         if ev.audit_notes and ev.previous_draft:
             audit_feedback = (
                 "\n## Previous Draft (Rejected by Auditor)\n"
-                f"{ev.previous_draft[:3000]}\n\n"
+                f"{ev.previous_draft}\n\n"
                 "## Auditor Rejection Notes\n"
                 f"{ev.audit_notes}\n\n"
                 "Revise the draft above to address the auditor's specific objections.\n"
             )
         prompt = REDLINER_USER.format(
-            gap_analysis=ev.gap_analysis[:8000],
+            gap_analysis=ev.gap_analysis,
             audit_feedback=audit_feedback,
         )
         response = await self.llm_redliner.achat(messages=_chat_messages(REDLINER_SYSTEM, prompt))
@@ -651,7 +660,7 @@ class ComplianceWorkflow(Workflow):
                     proposed_updates=ev.proposed_updates,
                     audit_notes=ev.audit_notes,
                     passed=ev.passed,
-                    status="approved" if ev.passed else "review_required",
+                    status="pending_human_review" if ev.passed else "review_required",
                     matched_policies=_policy_provenance(matched_policies),
                     retrieval_scores=retrieval_scores,
                     reranker_used=reranker_used,
@@ -681,11 +690,15 @@ class ComplianceWorkflow(Workflow):
         matched_policies = await ctx.store.get("matched_policies", default=[])
         obligation_evidence = await ctx.store.get("obligation_evidence", default=[])
         prompt = AUDITOR_USER.format(
-            regulation_text=ev.regulation.regulation_text[:12000],
-            policies_text=_format_policy_evidence(matched_policies),
-            obligation_evidence=_format_obligation_evidence(obligation_evidence),
-            gap_analysis=ev.gap_analysis[:6000],
-            proposed_updates=ev.proposed_updates[:6000],
+            regulation_text="\n".join(
+                bundle["obligation"]["quote"] for bundle in obligation_evidence
+            ),
+            policies_text=_format_policy_evidence(matched_policies, max_chars=1000000),
+            obligation_evidence=_format_obligation_evidence(
+                obligation_evidence, max_chars=1000000, per_obligation_chars=1000000
+            ),
+            gap_analysis=ev.gap_analysis,
+            proposed_updates=ev.proposed_updates,
         )
 
         response = await self.llm_auditor.achat(messages=_chat_messages(AUDITOR_SYSTEM, prompt))
@@ -706,19 +719,8 @@ class ComplianceWorkflow(Workflow):
     # ------------------------------------------------------------------
     @step
     async def collect_report(self, ctx: Context, ev: FinalReportEvent) -> StopEvent:
-        """Finalize workflow state and emit a provenance-bearing report."""
+        """Emit a report; the CLI persists it before updating document state."""
         logger.info("Report ready for '%s' (passed=%s).", ev.source_url, ev.passed)
-
-        from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-        self.qdrant.set_payload(
-            collection_name=self.settings.qdrant_regulatory_collection,
-            payload={"is_processed": True, "workflow_status": ev.status},
-            points=Filter(
-                must=[FieldCondition(key="document_id", match=MatchValue(value=ev.document_id))]
-            ),
-        )
-
         return StopEvent(
             result={
                 "document_id": ev.document_id,
@@ -742,6 +744,7 @@ class ComplianceWorkflow(Workflow):
                 "retrieval_scores": ev.retrieval_scores,
                 "reranker_used": ev.reranker_used,
                 "audit_retries": ev.audit_retries,
-                    "obligation_evidence": ev.obligation_evidence,
+                "obligation_evidence": ev.obligation_evidence,
+                "assessments": await ctx.store.get("assessments", default=[]),
             }
         )

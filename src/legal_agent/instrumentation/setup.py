@@ -55,7 +55,6 @@ def _init_phoenix(settings: "Settings") -> None:
         return
 
     try:
-        import phoenix as px
         from opentelemetry import trace as otel_trace
         from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
         from opentelemetry.sdk.trace import TracerProvider
@@ -63,6 +62,8 @@ def _init_phoenix(settings: "Settings") -> None:
 
         # Launch local Phoenix server if using localhost endpoint
         if "localhost" in settings.phoenix_endpoint and not settings.phoenix_external:
+            import phoenix as px
+
             px.launch_app()
 
         # Add Phoenix as a second OTel exporter so spans go to BOTH

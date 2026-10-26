@@ -72,19 +72,26 @@ def parse_obligations(
     source_text: str,
     *,
     maximum: int = 30,
+    strict: bool = False,
 ) -> list[LegalObligation]:
     """Parse model output and retain only obligations with verifiable source quotes."""
     if not content:
+        if strict:
+            raise ValueError("Obligation extraction returned no content")
         return _fallback_obligations(source_text)[:maximum]
 
     try:
         payload = json.loads(_clean_json(content))
         raw_items = payload.get("obligations", payload) if isinstance(payload, dict) else payload
         if not isinstance(raw_items, list):
-            return _fallback_obligations(source_text)[:maximum]
+            raise ValueError("Obligation extraction must return a list")
+        if strict and len(raw_items) >= maximum:
+            raise ValueError("Obligation extraction reached the configured limit")
         obligations: list[LegalObligation] = []
         for index, raw_item in enumerate(raw_items[:maximum], start=1):
             if not isinstance(raw_item, dict):
+                if strict:
+                    raise ValueError("Obligation extraction contained a non-object")
                 continue
             raw_item = dict(raw_item)
             raw_item.setdefault("obligation_id", f"obligation-{index}")
@@ -92,10 +99,13 @@ def parse_obligations(
             obligation = LegalObligation.model_validate(raw_item)
             if obligation.quote and obligation.quote in source_text:
                 obligations.append(obligation)
-        if obligations:
+            elif strict:
+                raise ValueError("Obligation quote was not found in its source chunk")
+        if obligations or strict:
             return obligations
     except (TypeError, ValueError, json.JSONDecodeError):
-        pass
+        if strict:
+            raise
 
     return _fallback_obligations(source_text)[:maximum]
 

@@ -112,7 +112,7 @@ def run_workflow() -> None:
     from langfuse import get_client, propagate_attributes
 
     from legal_agent.instrumentation import init_observability
-    from legal_agent.utils.report import save_report
+    from legal_agent.utils.state import persist_workflow_result
     from legal_agent.workflow import ComplianceWorkflow
 
     init_observability(settings)
@@ -134,7 +134,7 @@ def run_workflow() -> None:
                 if isinstance(result, dict) and result.get("reports") == []:
                     break
 
-                path = save_report(result)
+                path = persist_workflow_result(settings, result)
                 processed += 1
                 click.echo(f"Report saved to {path} (status={result.get('status', 'unknown')})")
 
@@ -150,6 +150,52 @@ def run_workflow() -> None:
         logger.info("Langfuse spans flushed.")
     except Exception:
         logger.debug("Langfuse flush skipped.", exc_info=True)
+
+
+@cli.command("review-report")
+@click.argument("report_file", type=click.Path(exists=True, dir_okay=False))
+@click.option("--decision", type=click.Choice(["approve", "reject"]), required=True)
+@click.option("--reviewer", required=True, help="Human reviewer name or ID.")
+@click.option("--reason", required=True, help="Rationale for the decision.")
+def review_report(report_file: str, decision: str, reviewer: str, reason: str) -> None:
+    """Record an accountable human decision for a saved report."""
+    from copy import deepcopy
+    from datetime import UTC, datetime
+    from pathlib import Path
+
+    from legal_agent.utils.report import load_report, write_report
+    from legal_agent.utils.state import mark_document_state
+
+    if not reviewer.strip() or not reason.strip():
+        raise click.UsageError("Reviewer and reason must be non-empty.")
+    path = Path(report_file)
+    result = load_report(path)
+    original = deepcopy(result)
+    current_status = result.get("status")
+    if current_status not in {"pending_human_review", "review_required"}:
+        raise click.UsageError(f"Report cannot be reviewed from status {current_status!r}.")
+    if decision == "approve" and current_status != "pending_human_review":
+        raise click.UsageError("Only a report that passed automated checks can be approved.")
+    result["review"] = {
+        "decision": decision,
+        "reviewer": reviewer.strip(),
+        "reason": reason.strip(),
+        "reviewed_at": datetime.now(UTC).isoformat(),
+    }
+    result["status"] = "approved" if decision == "approve" else "rejected"
+    write_report(path, result)
+    try:
+        mark_document_state(
+            get_settings(),
+            result["document_id"],
+            result["status"],
+            expected_status=current_status,
+            expected_hash=result.get("document_hash"),
+        )
+    except Exception:
+        write_report(path, original)
+        raise
+    click.echo(f"Recorded {decision} decision in {path}.")
 
 
 @cli.command("load-policies-pdf")
@@ -272,6 +318,16 @@ def status() -> None:
             )
         )
         click.echo(f"  Regulations requiring review: {review_required}")
+        pending_human = _count_documents(
+            Filter(
+                must=[
+                    FieldCondition(
+                        key="workflow_status", match=MatchValue(value="pending_human_review")
+                    )
+                ]
+            )
+        )
+        click.echo(f"  Awaiting human decision: {pending_human}")
     except Exception:
         click.echo("  Could not count workflow states.")
 

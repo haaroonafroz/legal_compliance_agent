@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import UTC, datetime
+import re
+from hashlib import sha256
 from pathlib import Path
 from typing import Any
 
@@ -16,36 +17,52 @@ REPORTS_DIR = Path("data/reports")
 def save_report(result: dict[str, Any]) -> Path:
     """Persist a workflow result dict as a timestamped JSON + Markdown pair."""
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
-    slug = (result.get("source_url", "unknown").split("/")[-1] or "report")[:40]
-    document_suffix = str(result.get("document_id", "unknown"))[:12]
-    base = f"{ts}_{slug}_{document_suffix}"
+    document_id = str(result.get("document_id", ""))
+    if not document_id:
+        raise ValueError("Cannot save a report without document_id")
+    safe_id = re.sub(r"[^A-Za-z0-9_-]", "_", document_id)[:64]
+    base = f"{safe_id}_{sha256(document_id.encode()).hexdigest()[:12]}"
 
     json_path = REPORTS_DIR / f"{base}.json"
-    json_path.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
-
-    md_path = REPORTS_DIR / f"{base}.md"
-    md_path.write_text(_render_markdown(result), encoding="utf-8")
+    write_report(json_path, result)
+    md_path = json_path.with_suffix(".md")
 
     logger.info("Report saved: %s", md_path)
     return md_path
 
 
+def load_report(path: Path) -> dict[str, Any]:
+    """Load the JSON paired with a JSON or Markdown report path."""
+    json_path = path.with_suffix(".json")
+    result = json.loads(json_path.read_text(encoding="utf-8"))
+    if not isinstance(result, dict) or not result.get("document_id"):
+        raise ValueError("Report has no document ID")
+    return result
+
+
+def write_report(path: Path, result: dict[str, Any]) -> None:
+    """Write both report formats before the workflow changes durable state."""
+    json_path = path.with_suffix(".json")
+    md_path = path.with_suffix(".md")
+    json_path.parent.mkdir(parents=True, exist_ok=True)
+    json_tmp = json_path.with_suffix(".json.tmp")
+    md_tmp = md_path.with_suffix(".md.tmp")
+    json_tmp.write_text(json.dumps(result, indent=2, default=str), encoding="utf-8")
+    md_tmp.write_text(_render_markdown(result), encoding="utf-8")
+    json_tmp.replace(json_path)
+    md_tmp.replace(md_path)
+
+
 def _render_markdown(result: dict[str, Any]) -> str:
     status = result.get("status", "unknown")
-    if result.get("skipped"):
-        return f"""\
-# Compliance Workflow Report
-
-- Status: **{status.upper()}**
-- Jurisdiction: {result.get("jurisdiction", "N/A")}
-- Source URL: {result.get("source_url", "N/A")}
-- Reason: {result.get("reason", "N/A")}
-- Document ID: {result.get("document_id", "N/A")}
-- Revision ID: {result.get("revision_id", "N/A")}
-"""
-
-    passed = "PASS" if result.get("passed") else "FAIL"
+    review = result.get("review") or {}
+    review_lines = (
+        f"- Human decision: {review.get('decision', 'pending')}\n"
+        f"- Reviewer: {review.get('reviewer', 'N/A')}\n"
+        f"- Reviewed at: {review.get('reviewed_at', 'N/A')}\n"
+        f"- Review rationale: {review.get('reason', 'N/A')}"
+    )
+    passed = "NOT RUN" if result.get("skipped") else ("PASS" if result.get("passed") else "FAIL")
     retrieved = result.get("matched_policies", [])
     scores = result.get("retrieval_scores", [])
     obligation_evidence = result.get("obligation_evidence", [])
@@ -78,19 +95,28 @@ def _render_markdown(result: dict[str, Any]) -> str:
         )
         or "_No obligation evidence recorded._"
     )
+    assessment_lines = (
+        "\n".join(
+            f"- `{item.get('obligation_id', 'unknown')}`: **{item.get('outcome', 'unknown')}** — "
+            f"{item.get('explanation', '')}"
+            for item in result.get("assessments", [])
+        )
+        or "_No structured assessments recorded._"
+    )
 
     return f"""\
-# Compliance Report
+# Policy Coverage Review
 
 | Field | Value |
 |---|---|
 | Workflow Status | **{status.upper()}** |
+| Reason | {result.get("reason", "N/A")} |
 | Jurisdiction | {result.get("jurisdiction", "N/A")} |
 | Source URL | {result.get("source_url", "N/A")} |
 | Source Key | {result.get("source_key", "N/A")} |
 | Revision ID | {result.get("revision_id", "N/A")} |
 | Document Type | {result.get("document_type", "N/A")} |
-| Audit Result | **{passed}** |
+| Model Audit Result | **{passed}** |
 | Audit Retries | {result.get("audit_retries", 0)} |
 | Reranker Used | {result.get("reranker_used", False)} |
 
@@ -123,4 +149,14 @@ def _render_markdown(result: dict[str, Any]) -> str:
 ## Obligation Evidence
 
 {obligation_lines}
+
+## Structured Assessments
+
+{assessment_lines}
+
+---
+
+## Human Review
+
+{review_lines}
 """
