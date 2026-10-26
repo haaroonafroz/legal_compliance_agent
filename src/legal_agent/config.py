@@ -82,6 +82,14 @@ class Settings(BaseSettings):
     voyage_api_key: str | None = None
     voyage_model: str = "rerank-2.5"
 
+    # Obligation-centric retrieval
+    obligation_extraction_max: int = 30
+    obligation_retrieval_top_k: int = 20
+    obligation_retrieval_final_k: int = 5
+    obligation_min_evidence_hits: int = 1
+    obligation_min_retrieval_score: float = 0.0
+    obligation_neighbor_hops: int = 1
+
 
 def get_settings() -> Settings:
     return Settings()

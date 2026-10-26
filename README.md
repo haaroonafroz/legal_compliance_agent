@@ -225,6 +225,21 @@ Regulatory documents move from `pending` to `approved`, `review_required`, or
 `irrelevant`. A failed final audit is retained as `review_required`; it is not silently
 treated as an approved compliance result.
 
+## Obligation-centric workflow
+
+`legal-agent run-workflow` first extracts atomic duties, prohibitions, deadlines, and
+conditional requirements from each relevant regulation. The Librarian then runs a
+separate dense+sparse policy search for every obligation, expands adjacent policy
+chunks, and optionally reranks the evidence. The Analyst and Auditor receive this
+obligation-to-evidence mapping, rather than one undifferentiated policy bundle.
+
+The evidence gate requires each obligation to meet the configured minimum hit and
+score thresholds. Documents that fail the gate become `review_required` and do not
+produce automatic gap analysis or redlines. Tune the bounded retrieval loop with
+`OBLIGATION_RETRIEVAL_TOP_K`, `OBLIGATION_RETRIEVAL_FINAL_K`,
+`OBLIGATION_MIN_EVIDENCE_HITS`, `OBLIGATION_MIN_RETRIEVAL_SCORE`, and
+`OBLIGATION_NEIGHBOR_HOPS`.
+
 ## LLM and Embedding Model choices
 
 The code supports several operating modes to balance cost, performance, and domain specificity:
@@ -239,6 +254,7 @@ The code supports several operating modes to balance cost, performance, and doma
 The current model routing is intentionally designed to optimize both cost and quality:
 
 - `analyst`, `redliner`, and `auditor` steps require deep legal reasoning, so they are routed to stronger models (or higher thinking modes if using Gemini).
+- `obligation_extractor` uses the analyst route once per document to produce structured duties for focused retrieval.
 - `relevance_check` acts as a fast filter and can safely use a cheaper, faster model.
 - `enrichment` runs with thinking disabled on the local Qwen model, or uses `gpt-4o-mini` in OpenAI mode.
 

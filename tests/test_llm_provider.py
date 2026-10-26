@@ -18,7 +18,7 @@ def test_local_reasoning_profiles():
     }
     assert local_chat_template_kwargs("auditor") == {
         "enable_thinking": True,
-        "reasoning_effort": "xHigh",
+        "reasoning_effort": "xhigh",
     }
 
 
@@ -48,6 +48,6 @@ def test_local_provider_forwards_auditor_reasoning(monkeypatch):
     assert captured["additional_kwargs"]["extra_body"] == {
         "chat_template_kwargs": {
             "enable_thinking": True,
-            "reasoning_effort": "xHigh",
+            "reasoning_effort": "xhigh",
         }
     }

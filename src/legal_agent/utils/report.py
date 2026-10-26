@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 import logging
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 
@@ -16,7 +16,7 @@ REPORTS_DIR = Path("data/reports")
 def save_report(result: dict[str, Any]) -> Path:
     """Persist a workflow result dict as a timestamped JSON + Markdown pair."""
     REPORTS_DIR.mkdir(parents=True, exist_ok=True)
-    ts = datetime.now(tz=timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    ts = datetime.now(tz=UTC).strftime("%Y%m%dT%H%M%SZ")
     slug = (result.get("source_url", "unknown").split("/")[-1] or "report")[:40]
     document_suffix = str(result.get("document_id", "unknown"))[:12]
     base = f"{ts}_{slug}_{document_suffix}"
@@ -48,6 +48,7 @@ def _render_markdown(result: dict[str, Any]) -> str:
     passed = "PASS" if result.get("passed") else "FAIL"
     retrieved = result.get("matched_policies", [])
     scores = result.get("retrieval_scores", [])
+    obligation_evidence = result.get("obligation_evidence", [])
     retrieval_lines = (
         "\n".join(
             (
@@ -60,6 +61,22 @@ def _render_markdown(result: dict[str, Any]) -> str:
             if index < len(scores)
         )
         or "_No retrieval provenance recorded._"
+    )
+    obligation_lines = (
+        "\n\n".join(
+            (
+                f"### {bundle.get('obligation_id', 'unknown')} "
+                f"({'sufficient' if bundle.get('sufficient') else 'insufficient'})\n"
+                f"Quote: {bundle.get('obligation', {}).get('quote', 'N/A')}\n"
+                "Evidence chunks: "
+                + ", ".join(
+                    str(policy.get("chunk_id") or policy.get("document_id") or "unknown")
+                    for policy in bundle.get("matched_policies", [])
+                )
+            )
+            for bundle in obligation_evidence
+        )
+        or "_No obligation evidence recorded._"
     )
 
     return f"""\
@@ -100,4 +117,10 @@ def _render_markdown(result: dict[str, Any]) -> str:
 ## Retrieved Policy Evidence
 
 {retrieval_lines}
+
+---
+
+## Obligation Evidence
+
+{obligation_lines}
 """

@@ -128,7 +128,7 @@ def run_workflow() -> None:
             version="0.1.0",
         ):
             while True:
-                wf = ComplianceWorkflow(settings=settings, timeout=300)
+                wf = ComplianceWorkflow(settings=settings, timeout=1200)
                 result = await wf.run()
 
                 if isinstance(result, dict) and result.get("reports") == []:

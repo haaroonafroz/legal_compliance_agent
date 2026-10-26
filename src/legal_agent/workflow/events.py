@@ -5,6 +5,8 @@ from __future__ import annotations
 from llama_index.core.workflow import Event
 from pydantic import Field
 
+from legal_agent.utils.obligations import LegalObligation
+
 
 class NewLawEvent(Event):
     """Emitted by the Horizon Scanner after grouping unprocessed regulation chunks."""
@@ -40,6 +42,14 @@ class RetrievedContextEvent(Event):
     matched_policies: list[dict]
     retrieval_scores: list[float] = Field(default_factory=list)
     reranker_used: bool = False
+    obligation_evidence: list[dict] = Field(default_factory=list)
+
+
+class ObligationsExtractedEvent(Event):
+    """Emitted after the regulation has been decomposed into atomic obligations."""
+
+    regulation: NewLawEvent
+    obligations: list[LegalObligation] = Field(default_factory=list)
 
 
 class RelevantContextEvent(Event):
@@ -49,6 +59,7 @@ class RelevantContextEvent(Event):
     matched_policies: list[dict]
     retrieval_scores: list[float]
     reranker_used: bool = False
+    obligation_evidence: list[dict] = Field(default_factory=list)
 
 
 class AnalysisCompleteEvent(Event):
@@ -59,6 +70,7 @@ class AnalysisCompleteEvent(Event):
     gap_analysis: str
     audit_notes: str | None = None
     previous_draft: str | None = None
+    obligation_evidence: list[dict] = Field(default_factory=list)
 
 
 class DraftCompleteEvent(Event):
@@ -103,3 +115,4 @@ class FinalReportEvent(Event):
     legal_identifier: str = ""
     language: str = ""
     is_current: bool = True
+    obligation_evidence: list[dict] = Field(default_factory=list)

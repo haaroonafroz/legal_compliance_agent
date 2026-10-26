@@ -15,7 +15,7 @@ _LOCAL_REASONING: dict[str, tuple[bool, str | None]] = {
     "relevance_check": (False, None),
     "analyst": (True, "medium"),
     "redliner": (True, "low"),
-    "auditor": (True, "xHigh"),
+    "auditor": (True, "xhigh"),
 }
 
 
