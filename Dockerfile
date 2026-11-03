@@ -14,6 +14,8 @@ RUN python -m pip install --no-cache-dir torch==2.13.0 torchvision==0.28.0 \
     --index-url https://download.pytorch.org/whl/cpu
 COPY src ./src
 COPY data/sources ./data/sources
+COPY data/policies ./data/policies
+COPY evals ./evals
 RUN python -m pip install --no-cache-dir .
 
 RUN useradd --system --create-home --uid 10001 agent \

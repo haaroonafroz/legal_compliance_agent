@@ -9,22 +9,23 @@ is legally compliant.
 
 ## How It Works
 
-The process has seven steps:
+The process has eight steps:
 
 1. **Scrape:** It finds new laws on the web.
-2. **Extract:** It identifies quoted obligations in every source chunk.
-3. **Retrieve:** It finds candidate policy text for each obligation.
-4. **Analyze:** It assesses written policy coverage for each obligation.
-5. **Draft:** It proposes text for identified policy gaps.
-6. **Model audit:** It checks the draft for inconsistencies.
-7. **Human review:** A person decides whether to approve or reject the report.
+2. **Screen:** It filters irrelevant material with a bounded, low-cost relevance check.
+3. **Extract:** It identifies quoted obligations in every source chunk.
+4. **Retrieve:** It finds candidate policy text for each obligation.
+5. **Analyze:** It assesses written policy coverage for each obligation.
+6. **Draft:** It proposes text for identified policy gaps.
+7. **Model audit:** It checks the draft for inconsistencies.
+8. **Human review:** A person decides whether to approve or reject the report.
 
 Workflow steps (Agents):
 
 1. `Horizon Scanner`: groups unprocessed regulation chunks back into complete documents.
-2. `Obligation Extractor`: returns source-quoted duties for each document chunk.
-3. `Librarian`: runs hybrid retrieval against internal policies per obligation.
-4. `Relevance Check`: filters out site noise and non-regulatory content.
+2. `Relevance Check`: filters out site noise before extraction and retrieval.
+3. `Obligation Extractor`: returns source-quoted duties for each document chunk.
+4. `Librarian`: runs hybrid retrieval against internal policies per obligation.
 5. `Analyst`: assesses policy coverage with validated source and policy citations.
 6. `Redliner`: drafts policy amendments in redline form.
 7. `Auditor`: checks for hallucinations, weak reasoning, and draft mismatch before review.
@@ -35,7 +36,8 @@ We use a few key tools to build this agent:
 
 - **Scrapy:** Crawls websites to find new legal texts.
 - **Docling:** Turns PDF files into plain text.
-- **Qdrant:** A smart database. It stores and finds the right text chunks fast.
+- **PostgreSQL:** Durable document, job-claim, report, and review state.
+- **Qdrant:** Stores and retrieves text chunks and vectors; it is not the source of truth for workflow state.
 - **LlamaIndex:** Runs the step-by-step agent logic.
 - **Langfuse & Phoenix:** Tracks costs and AI choices so you can test the agent.
 
@@ -94,11 +96,14 @@ Open the `.env` file. Add your keys.
 
 ### 3. Set Up the Database
 
-Create the tables in Qdrant.
+Start local PostgreSQL and Qdrant, then create the PostgreSQL schema and Qdrant collections.
 
 ```bash
+docker compose up -d postgres qdrant
 legal-agent init-db
 ```
+
+For a managed database, set `DATABASE_URL` first and run `legal-agent migrate-db` as a separate, one-time release step. `init-db` also initializes Qdrant.
 
 ### 4. Add Your Policy
 
@@ -127,8 +132,8 @@ legal-agent run-workflow
 ```
 
 The agent processes all complete, pending regulatory documents and saves one JSON and
-one Markdown report per document in `data/reports/`. It saves both files before marking
-the document processed in Qdrant. A model audit pass produces `pending_human_review`.
+one durable JSON report per document in PostgreSQL, then tries to export JSON and
+Markdown files to `data/reports/`. A model audit pass produces `pending_human_review`.
 
 ### 7. Record a human decision
 
@@ -142,7 +147,7 @@ legal-agent review-report data/reports/<report-name>.md \
 
 `approve` is allowed only for `pending_human_review`. A reviewer can `reject` a report
 that is pending review or marked `review_required`. The decision and timestamp are
-written to both report formats and reflected in Qdrant. The command does not edit an
+committed to PostgreSQL, then mirrored to local exports and Qdrant when available. The command does not edit an
 internal policy or implement a control.
 
 ## CLI Commands
@@ -224,7 +229,7 @@ If Langfuse keys are missing, Langfuse init is skipped (warning in logs). If PHO
 
 ## Vector Collection
 
-Qdrant is used as both the staging layer and the retrieval layer:
+PostgreSQL governs acquisition and workflow state; Qdrant stages and retrieves text:
 
 - `regulatory_updates` stores scraped regulation chunks plus processing state
 - `internal_policies` stores chunked internal policy text for retrieval
@@ -242,7 +247,7 @@ status, extracted length, navigation content, and legal-content signals. Only
 borderline candidates use the cheaper content-validation model. Rejected documents
 are recorded in `QUARANTINE_FILE`.
 
-The document manifest at `MANIFEST_FILE` tracks canonical source identities and
+The PostgreSQL document manifest configured by `DATABASE_URL` tracks canonical source identities and
 content revisions. Unchanged revisions are skipped, while changed revisions
 supersede older ones. Conversion, model, and persistence failures become
 dead-lettered records that can be requeued with `legal-agent retry-dead-letters`.
@@ -262,10 +267,9 @@ separate dense+sparse policy search for every obligation, expands adjacent polic
 chunks, and optionally reranks the evidence. The Analyst and Auditor receive this
 obligation-to-evidence mapping, rather than one undifferentiated policy bundle.
 
-The retrieval gate requires each obligation to have candidate policy evidence meeting
-the configured hit and score thresholds. This gate measures retrieval availability,
-not legal sufficiency. Documents that fail it become `review_required` and do not
-produce automatic gap analysis or redlines. The Analyst then returns one structured
+The retrieval gate checks whether candidate evidence can be trusted. Weak matches
+become `review_required`; no matches in a populated policy corpus produce a potential
+gap for human review. An empty or unavailable policy corpus becomes `review_required`. The Analyst then returns one structured
 policy-coverage assessment for each obligation. The code checks obligation IDs and
 verbatim source and policy citations; malformed, missing, or uncertain assessments
 also require review. Tune the bounded retrieval loop with
@@ -301,7 +305,7 @@ flowchart LR
     Load --> Policies[(Qdrant: internal_policies)]
     Regs --> Workflow
     Policies --> Retrieve
-    Report --> Data[(Mounted data/: reports, SQLite manifest, policies)]
+    Report --> Data[(PostgreSQL: manifest, claims, reports, reviews)]
     Data --> Review
     Review --> Regs
     Scrape --> Data
@@ -316,10 +320,12 @@ flowchart LR
 
 No queue, scheduler, API server, or multi-container deployment is included yet.
 The container exits when its command finishes. Keep `data/` on durable storage so
-reports and the SQLite acquisition manifest survive container replacement. Qdrant,
-model endpoints, and optional tracing services must be reachable from the container.
-Running multiple copies later will require shared report/manifest storage and a way
-to claim work so two workers do not process the same document.
+optional local report exports and input policies survive container replacement. The
+authoritative manifest and reports live in PostgreSQL. Qdrant, model endpoints, and
+optional tracing services must be reachable from the container.
+PostgreSQL claims use row locks and expiring leases so concurrent workers do not process
+the same current document. The worker must finish within the lease; expired claims can
+be retried. Reports and review decisions remain in PostgreSQL across container replacement.
 
 Build and run the workflow manually:
 
@@ -330,7 +336,9 @@ docker run --rm --env-file .env \
   -v "$PWD/data:/app/data" legal-agent legal-agent run-workflow
 ```
 
-The image defaults to hosted LLM mode; configure the provider keys in `.env`.
+The image defaults to hosted LLM mode, but `.env` can override it. A Docker container
+needs database and Qdrant addresses reachable from inside the container; the sample
+local `localhost` URLs in `.env.example` work only for commands run on the host.
 The Docker image uses the CPU PyTorch wheels described in the
 [PyTorch installation guide](https://pytorch.org/get-started/previous-versions/).
 Deployment to a cloud account still requires environment-specific infrastructure
@@ -365,3 +373,104 @@ This separation keeps high-volume, cost-sensitive steps cheap while preserving t
 ## License
 
 See `LICENSE`.
+
+## PostgreSQL persistence and migration
+
+`DATABASE_URL` is required for scraping, workflow processing, report review, and
+status. PostgreSQL holds document revisions, deduplicated indexed chunk IDs, current
+revision pointers, workflow claims and leases, JSON reports, and human decisions.
+Qdrant holds text and vectors for retrieval. A Qdrant status payload is only a
+best-effort mirror; a failed mirror cannot undo a committed review. Local JSON and
+Markdown reports are exports and may be regenerated from PostgreSQL. The application
+fails fast without `DATABASE_URL` instead of silently creating a new SQLite file.
+
+For local development:
+
+```bash
+docker compose up -d postgres qdrant
+cp .env.example .env
+# Add your model and embedding credentials to .env.
+legal-agent migrate-db
+legal-agent init-db
+```
+
+The Compose PostgreSQL URL is
+`postgresql://legal_agent:local_dev_only@localhost:5433/legal_agent` and is for
+local development only. `init-db` applies the migration again safely before setting
+up Qdrant. Use `docker compose down` to stop services; the named volumes retain
+local data. Do not use `down -v` unless you intend to erase them.
+
+For [Supabase](https://supabase.com/docs/guides/database/connecting-to-postgres),
+create a project in your own account, then copy the PostgreSQL
+connection string from **Connect** in its dashboard into a runtime secret named
+`DATABASE_URL`. Use a direct connection for migrations when your network supports
+its endpoint. If the runtime is IPv4 only, choose the session pooler URL from the
+dashboard. Percent-encode reserved password characters. Require TLS with
+`sslmode=require`; for certificate verification, download the project CA and use
+`sslmode=verify-full&sslrootcert=/path/to/ca.crt`. Run `legal-agent migrate-db`
+once with a role that can create tables and indexes, and use a separate role with
+only table read/write permissions for routine workers. Restrict network access,
+rotate credentials, and keep both the URL and CA path out of Git and image layers.
+Back up the database before schema changes. This application does not require a
+Supabase API key or service-role key. The SQL uses transaction-scoped locks and row
+claims, so PostgreSQL is needed for the lifecycle guarantees; Redis is not a
+replacement for durable reports or accountable review decisions.
+
+[Neon](https://neon.com/docs/connect/connect-from-any-app) is another managed PostgreSQL option if you want its branching workflow.
+[Cloud SQL for PostgreSQL](https://docs.cloud.google.com/sql/docs/postgres/connect-run) is a natural later choice when deploying Cloud Run Jobs on
+Google Cloud. Neither is needed to validate the code locally; the standard
+`DATABASE_URL` works across providers. No hosted service is provisioned by this
+repository.
+
+Existing local state is retained. Before switching a populated installation,
+back up `data/state/document_manifest.sqlite3` and `data/reports/`, then preview:
+
+```bash
+legal-agent import-legacy-state
+legal-agent import-legacy-state --apply
+```
+
+`--apply` requires an empty, already migrated PostgreSQL manifest and leaves the
+SQLite database and report files untouched. It matches reports by document ID and
+source hash, flags unmatched or uncredited decisions, and imports in one
+transaction. Verify Qdrant still has the corresponding source chunks before
+running workers. Old reports with no reliable identity remain local for manual
+review. Run the preview first and inspect any warnings.
+
+### Worker and review behavior
+
+A workflow worker claims one current document in PostgreSQL for at most
+`WORKFLOW_LEASE_SECONDS` (default 1800). The workflow timeout is 1200 seconds, so
+the lease must be longer. A worker commits its result only if the same claim and
+source hash are still current. Failed runs release their claim and exit with an
+error; they are not marked complete. Expired claims can be taken by another
+worker. Review decisions are conditional updates of the durable report and source
+revision. Use either `legal-agent review-report <document-id> ...` or pass a local
+report export path. Local exports and Qdrant status fields can lag the database.
+
+### Fictional evaluation set
+
+`evals/synthetic_cases.json` contains explicitly fictional internal policies and
+GDPR/EDPB-inspired notices. They are **not legal advice or verbatim legal text**.
+The cases cover full, partial, missing, ambiguous, outdated, conflicting, multiple,
+and changed requirements, plus fabricated citations and prompt injection. Offline
+tests verify the fixture and reject unsupported quotations. To seed one scenario
+through the application's ingestion paths, run:
+
+```bash
+python -m evals.seed_synthetic --case full-coverage
+python -m evals.seed_synthetic --case multiple-obligations
+```
+
+Seeding requires configured PostgreSQL, Qdrant, and embedding models and makes
+network/model calls. Run one case at a time in a disposable collection because
+unrelated fictional policies can affect retrieval. To evaluate the analyst LLM
+without seeding or scraping, run:
+
+```bash
+python -m evals.run_analyst_eval --output evals/results.json
+```
+
+The live harness reports outcome accuracy, invalid output rate, mean latency, a
+confusion table, and case details. It uses the configured LLM and may incur model
+charges. `evals/results.json` is a local artifact and should not be committed.

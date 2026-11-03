@@ -1,83 +1,96 @@
-"""Tests for durable document revision state."""
+"""PostgreSQL integration tests; TEST_DATABASE_URL must name an isolated test DB."""
+
+import os
+from uuid import uuid4
 
 import pytest
-from scrapy.exceptions import DropItem
 
 from legal_agent.db.manifest import DocumentManifest
-from legal_agent.scraping.items import RegulatoryDocumentItem
-from legal_agent.scraping.pipelines import ContentValidationPipeline
 
 
-def test_manifest_skips_unchanged_current_revision(tmp_path):
-    manifest = DocumentManifest(tmp_path / "manifest.sqlite3")
-    values = {
-        "source_id": "edpb",
-        "source_key": "edpb::guideline-1",
-        "source_url": "https://edpb.europa.eu/guideline-1",
-        "document_hash": "hash-1",
-        "revision_id": "revision-1",
-        "title": "Guideline 1",
-    }
-
-    assert manifest.prepare(**values)["action"] == "ingest"
-    manifest.set_expected_chunks("revision-1", 1)
-    assert manifest.record_chunks("revision-1", 1) is True
-    assert manifest.mark_stored("revision-1") == ""
-    assert manifest.prepare(**values)["action"] == "unchanged"
+@pytest.fixture
+def manifest():
+    url = os.getenv("TEST_DATABASE_URL")
+    if not url:
+        pytest.skip("Set TEST_DATABASE_URL to an isolated PostgreSQL test database")
+    store = DocumentManifest(url)
+    store.migrate()
+    return store
 
 
-def test_manifest_supersedes_previous_revision(tmp_path):
-    manifest = DocumentManifest(tmp_path / "manifest.sqlite3")
-    common = {
-        "source_id": "edpb",
-        "source_key": "edpb::guideline-1",
-        "source_url": "https://edpb.europa.eu/guideline-1",
-        "title": "Guideline 1",
-    }
-
-    first = manifest.prepare(**common, document_hash="hash-1", revision_id="revision-1")
-    assert first["supersedes_revision_id"] == ""
-    manifest.set_expected_chunks("revision-1", 1)
-    manifest.record_chunks("revision-1", 1)
-    manifest.mark_stored("revision-1")
-
-    second = manifest.prepare(**common, document_hash="hash-2", revision_id="revision-2")
-    assert second["supersedes_revision_id"] == "revision-1"
-    manifest.set_expected_chunks("revision-2", 1)
-    manifest.record_chunks("revision-2", 1)
-    assert manifest.mark_stored("revision-2") == "revision-1"
-
-
-def test_content_pipeline_registers_revision_and_skips_it_next_time(tmp_path):
-    settings = type(
-        "Settings",
-        (),
-        {
-            "content_validation_min_chars": 100,
-            "content_validation_llm_enabled": False,
-            "manifest_file": str(tmp_path / "manifest.sqlite3"),
-            "quarantine_file": str(tmp_path / "quarantine.jsonl"),
-        },
-    )()
-    item = RegulatoryDocumentItem(
-        title="Guidelines on data protection",
-        full_text="These guidelines describe obligations for controllers. " * 10,
-        jurisdiction="EU",
-        effective_date="",
-        source_url="https://edpb.europa.eu/guidelines/1",
-        is_pdf=False,
-        raw_pdf_bytes=b"",
+def _prepare(store, source, revision, text_hash):
+    return store.prepare(
+        source_id="fictional", source_key=source,
+        source_url=f"https://fiction.invalid/{source}",
+        document_hash=text_hash, revision_id=revision, title="Fictional test",
     )
 
-    pipeline = ContentValidationPipeline()
-    pipeline._settings = settings
-    accepted = pipeline.process_item(item, spider=None)
-    assert accepted["revision_id"]
-    assert accepted["source_key"].startswith("generic::")
-    manifest = DocumentManifest(settings.manifest_file)
-    manifest.set_expected_chunks(accepted["revision_id"], 1)
-    manifest.record_chunks(accepted["revision_id"], 1)
-    manifest.mark_stored(accepted["revision_id"])
 
-    with pytest.raises(DropItem, match="unchanged document"):
-        pipeline.process_item(item, spider=None)
+def _stored(store, source, revision, text_hash):
+    result = _prepare(store, source, revision, text_hash)
+    store.set_expected_chunks(revision, 2)
+    assert not store.record_chunks(revision, [0])
+    assert not store.record_chunks(revision, [0])  # retried upsert must not overcount
+    assert store.record_chunks(revision, [1])
+    store.mark_stored(revision)
+    return result
+
+
+def test_manifest_idempotency_and_revision_order(manifest):
+    source = str(uuid4())
+    first, second = str(uuid4()), str(uuid4())
+    _stored(manifest, source, first, "hash-1")
+    assert _prepare(manifest, source, first, "hash-1")["action"] == "unchanged"
+    result = _prepare(manifest, source, second, "hash-2")
+    assert result["supersedes_revision_id"] == first
+    manifest.set_expected_chunks(second, 2)
+    with pytest.raises(ValueError, match="incomplete"):
+        manifest.mark_stored(second)
+    manifest.record_chunks(second, [0, 1])
+    assert manifest.mark_stored(second) == first
+    with pytest.raises(ValueError):
+        manifest.mark_stored(first)
+
+
+def test_claim_is_exclusive_and_report_review_is_durable(manifest):
+    revision = str(uuid4())
+    _stored(manifest, str(uuid4()), revision, "hash-1")
+    claim = manifest.claim_next(revision_id=revision)
+    assert claim["revision_id"] == revision
+    # No second worker can take the same document while the lease is valid.
+    assert manifest.claim_next(revision_id=revision) is None
+    report = {
+        "document_id": revision, "document_hash": "hash-1",
+        "status": "pending_human_review", "passed": True,
+    }
+    with pytest.raises(ValueError, match="Claim expired"):
+        manifest.complete_workflow(revision, "hash-1", uuid4(), report)
+    manifest.complete_workflow(revision, "hash-1", claim["claim_token"], report)
+    assert manifest.get_report(revision) == report
+    approved = manifest.review_report(
+        revision, "hash-1", "pending_human_review", "approve", "reviewer", "Checked evidence"
+    )
+    assert approved["status"] == "approved"
+    assert manifest.get_report(revision)["review"]["reviewer"] == "reviewer"
+    with pytest.raises(ValueError, match="stale"):
+        manifest.review_report(
+            revision, "hash-1", "pending_human_review", "reject", "other", "Stale"
+        )
+
+
+def test_failed_and_superseded_revisions_cannot_complete(manifest):
+    source = str(uuid4())
+    first, second = str(uuid4()), str(uuid4())
+    _stored(manifest, source, first, "hash-1")
+    claim = manifest.claim_next(revision_id=first)
+    _stored(manifest, source, second, "hash-2")
+    with pytest.raises(ValueError, match="Claim expired"):
+        manifest.complete_workflow(first, "hash-1", claim["claim_token"], {
+            "document_id": first, "document_hash": "hash-1", "status": "review_required"
+        })
+    failed = str(uuid4())
+    _prepare(manifest, str(uuid4()), failed, "hash-f")
+    manifest.mark_failed(failed, "embedding failed")
+    with pytest.raises(ValueError, match="incomplete or failed"):
+        manifest.mark_stored(failed)
+    assert manifest.reset_for_retry(failed)

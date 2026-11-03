@@ -32,7 +32,7 @@ def parse_assessments(content: str | None, evidence_bundles: list[dict]) -> list
     payload = json.loads(cleaned)
     raw = payload.get("assessments") if isinstance(payload, dict) else None
     if not isinstance(raw, list):
-        raise ValueError("Analysis must return an assessments list")
+        raise ValueError("Analysis must return an assessments list")  # noqa: TRY004
     expected = {bundle["obligation_id"]: bundle for bundle in evidence_bundles}
     if len(expected) != len(evidence_bundles) or len(raw) != len(expected):
         raise ValueError("Analysis must contain exactly one result per obligation")

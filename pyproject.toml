@@ -15,6 +15,7 @@ dependencies = [
     "llama-index-llms-google-genai==0.10.0",
     "google-genai==2.19.0",
     "qdrant-client==1.19.0",
+    "psycopg[binary]>=3.2,<4",
     "fastembed==0.8.0",
     "scrapy==2.18.0",
     "docling==2.122.0",

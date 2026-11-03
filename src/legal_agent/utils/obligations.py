@@ -84,7 +84,7 @@ def parse_obligations(
         payload = json.loads(_clean_json(content))
         raw_items = payload.get("obligations", payload) if isinstance(payload, dict) else payload
         if not isinstance(raw_items, list):
-            raise ValueError("Obligation extraction must return a list")
+            raise ValueError("Obligation extraction must return a list")  # noqa: TRY004
         if strict and len(raw_items) >= maximum:
             raise ValueError("Obligation extraction reached the configured limit")
         obligations: list[LegalObligation] = []

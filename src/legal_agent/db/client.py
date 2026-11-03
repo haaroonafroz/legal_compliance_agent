@@ -17,5 +17,5 @@ def get_qdrant_client(url: str | None = None, api_key: str | None = None) -> Qdr
     return QdrantClient(url=url, api_key=api_key or None)
 
 
-def client_from_settings(settings: "Settings") -> QdrantClient:
+def client_from_settings(settings: Settings) -> QdrantClient:
     return get_qdrant_client(url=settings.qdrant_url, api_key=settings.qdrant_api_key)

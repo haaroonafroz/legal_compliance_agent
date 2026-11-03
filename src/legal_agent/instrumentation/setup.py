@@ -14,9 +14,9 @@ logger = logging.getLogger(__name__)
 _INITIALISED = False
 
 
-def init_observability(settings: "Settings") -> None:
+def init_observability(settings: Settings) -> None:
     """Wire up all observability backends. Safe to call multiple times."""
-    global _INITIALISED  # noqa: PLW0603
+    global _INITIALISED
     if _INITIALISED:
         return
 
@@ -29,7 +29,7 @@ def init_observability(settings: "Settings") -> None:
     logger.info("Observability stack initialised (Langfuse, Phoenix, LangWatch).")
 
 
-def _init_langfuse(settings: "Settings") -> None:
+def _init_langfuse(settings: Settings) -> None:
     if not settings.langfuse_secret_key:
         logger.warning("Langfuse secret key not set – skipping Langfuse init.")
         return
@@ -49,7 +49,7 @@ def _init_langfuse(settings: "Settings") -> None:
         logger.warning("Langfuse auth_check failed – check your keys and host.")
 
 
-def _init_phoenix(settings: "Settings") -> None:
+def _init_phoenix(settings: Settings) -> None:
     if not settings.phoenix_endpoint:
         logger.warning("Phoenix endpoint not set – skipping Phoenix init.")
         return
@@ -88,7 +88,7 @@ def _init_llamaindex_instrumentation() -> None:
         logger.warning("LlamaIndex instrumentation failed.", exc_info=True)
 
 
-def _init_langwatch(settings: "Settings") -> None:
+def _init_langwatch(settings: Settings) -> None:
     if not settings.langwatch_api_key:
         logger.warning("LangWatch API key not set – skipping LangWatch init.")
         return

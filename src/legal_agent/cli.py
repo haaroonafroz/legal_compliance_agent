@@ -23,15 +23,52 @@ def cli() -> None:
 
 @cli.command()
 def init_db() -> None:
-    """Create Qdrant collections and payload indexes."""
+    """Create PostgreSQL schema and Qdrant collections."""
     settings = get_settings()
     from legal_agent.db import ensure_collections, get_qdrant_client
     from legal_agent.db.manifest import DocumentManifest
 
     client = get_qdrant_client(url=settings.qdrant_url, api_key=settings.qdrant_api_key)
     ensure_collections(client, settings)
-    DocumentManifest(settings.manifest_file)
-    click.echo("Qdrant collections initialised.")
+    DocumentManifest(settings.database_url).migrate()
+    click.echo("PostgreSQL schema and Qdrant collections initialised.")
+
+
+@cli.command("migrate-db")
+def migrate_db() -> None:
+    """Apply the idempotent PostgreSQL schema migration."""
+    from legal_agent.db.manifest import DocumentManifest
+
+    DocumentManifest(get_settings().database_url).migrate()
+    click.echo("PostgreSQL migration complete.")
+
+
+@cli.command("import-legacy-state")
+@click.option("--sqlite", "sqlite_file", type=click.Path(exists=True, dir_okay=False),
+              default="data/state/document_manifest.sqlite3", show_default=True)
+@click.option("--reports-dir", type=click.Path(file_okay=False),
+              default="data/reports", show_default=True)
+@click.option("--apply", is_flag=True, help="Import into an empty migrated PostgreSQL database.")
+def import_legacy_state(sqlite_file: str, reports_dir: str, apply: bool) -> None:
+    """Preview or import existing SQLite state without changing the source files."""
+    from pathlib import Path
+
+    from legal_agent.db.legacy import import_legacy, preview_legacy
+    from legal_agent.db.manifest import DocumentManifest
+
+    source = Path(sqlite_file)
+    reports = Path(reports_dir)
+    rows, matched, warnings = preview_legacy(source, reports)
+    click.echo(f"Found {len(rows)} revisions and {len(matched)} matching reports.")
+    for warning in warnings:
+        click.echo(f"  {warning}")
+    if not apply:
+        click.echo("Preview only. Run with --apply after a backup and legal-agent migrate-db.")
+        return
+    imported_rows, imported_reports, _ = import_legacy(
+        DocumentManifest(get_settings().database_url), source, reports
+    )
+    click.echo(f"Imported {imported_rows} revisions and {imported_reports} reports.")
 
 
 @cli.command()
@@ -93,11 +130,10 @@ def retry_dead_letters(limit: int) -> None:
     settings = get_settings()
     from legal_agent.db.manifest import DocumentManifest
 
-    manifest = DocumentManifest(settings.manifest_file)
+    manifest = DocumentManifest(settings.database_url)
     records = manifest.retryable(limit=limit)
-    for record in records:
-        manifest.reset_for_retry(record["revision_id"])
-    click.echo(f"Requeued {len(records)} dead-lettered document(s).")
+    requeued = sum(manifest.reset_for_retry(record["revision_id"]) for record in records)
+    click.echo(f"Requeued {requeued} dead-lettered document(s).")
     if records:
         click.echo("Run `legal-agent scrape` to retry acquisition.")
 
@@ -111,6 +147,7 @@ def run_workflow() -> None:
 
     from langfuse import get_client, propagate_attributes
 
+    from legal_agent.db.manifest import DocumentManifest
     from legal_agent.instrumentation import init_observability
     from legal_agent.utils.state import persist_workflow_result
     from legal_agent.workflow import ComplianceWorkflow
@@ -118,6 +155,9 @@ def run_workflow() -> None:
     init_observability(settings)
 
     async def _run() -> None:
+        manifest = DocumentManifest(settings.database_url)
+        if settings.workflow_lease_seconds <= 1200:
+            raise click.UsageError("WORKFLOW_LEASE_SECONDS must exceed the 1200-second workflow timeout")
         model_name = (
             settings.local_llm_model if settings.use_local_llm else settings.openai_llm_model
         )
@@ -128,13 +168,20 @@ def run_workflow() -> None:
             version="0.1.0",
         ):
             while True:
-                wf = ComplianceWorkflow(settings=settings, timeout=1200)
-                result = await wf.run()
-
-                if isinstance(result, dict) and result.get("reports") == []:
+                claim = manifest.claim_next(settings.workflow_lease_seconds)
+                if claim is None:
                     break
-
-                path = persist_workflow_result(settings, result)
+                try:
+                    wf = ComplianceWorkflow(settings=settings, timeout=1200)
+                    result = await wf.run(
+                        document_id=claim["revision_id"], document_hash=claim["document_hash"]
+                    )
+                    if not isinstance(result, dict) or result.get("reports") == []:
+                        raise RuntimeError("Claimed document is missing or incomplete in Qdrant")
+                    path = persist_workflow_result(settings, result, claim)
+                except Exception:
+                    manifest.release_claim(claim["revision_id"], claim["claim_token"])
+                    raise
                 processed += 1
                 click.echo(f"Report saved to {path} (status={result.get('status', 'unknown')})")
 
@@ -153,55 +200,52 @@ def run_workflow() -> None:
 
 
 @cli.command("review-report")
-@click.argument("report_file", type=click.Path(exists=True, dir_okay=False))
+@click.argument("report_reference")
 @click.option("--decision", type=click.Choice(["approve", "reject"]), required=True)
 @click.option("--reviewer", required=True, help="Human reviewer name or ID.")
 @click.option("--reason", required=True, help="Rationale for the decision.")
-def review_report(report_file: str, decision: str, reviewer: str, reason: str) -> None:
-    """Record an accountable human decision for a saved report."""
-    from copy import deepcopy
-    from datetime import UTC, datetime
+def review_report(report_reference: str, decision: str, reviewer: str, reason: str) -> None:
+    """Review a document by ID or by a local report export path."""
     from pathlib import Path
 
+    from legal_agent.db.manifest import DocumentManifest
     from legal_agent.utils.report import load_report, write_report
-    from legal_agent.utils.state import mark_document_state
+    from legal_agent.utils.state import mirror_document_state
 
     if not reviewer.strip() or not reason.strip():
         raise click.UsageError("Reviewer and reason must be non-empty.")
-    path = Path(report_file)
-    result = load_report(path)
-    original = deepcopy(result)
+    path = Path(report_reference)
+    document_id = load_report(path)["document_id"] if path.exists() else report_reference
+    settings = get_settings()
+    manifest = DocumentManifest(settings.database_url)
+    result = manifest.get_report(document_id)
     current_status = result.get("status")
     if current_status not in {"pending_human_review", "review_required"}:
         raise click.UsageError(f"Report cannot be reviewed from status {current_status!r}.")
     if decision == "approve" and current_status != "pending_human_review":
         raise click.UsageError("Only a report that passed automated checks can be approved.")
-    result["review"] = {
-        "decision": decision,
-        "reviewer": reviewer.strip(),
-        "reason": reason.strip(),
-        "reviewed_at": datetime.now(UTC).isoformat(),
-    }
-    result["status"] = "approved" if decision == "approve" else "rejected"
-    write_report(path, result)
     try:
-        mark_document_state(
-            get_settings(),
-            result["document_id"],
-            result["status"],
-            expected_status=current_status,
-            expected_hash=result.get("document_hash"),
+        reviewed = manifest.review_report(
+            document_id, result["document_hash"], current_status,
+            decision, reviewer, reason,
         )
+    except ValueError as exc:
+        raise click.UsageError(str(exc)) from exc
+    if path.exists():
+        try:
+            write_report(path, reviewed)
+        except OSError:
+            logger.warning("Review committed; local report export could not be updated", exc_info=True)
+    try:
+        mirror_document_state(settings, document_id, reviewed["status"])
     except Exception:
-        write_report(path, original)
-        raise
-    click.echo(f"Recorded {decision} decision in {path}.")
+        logger.warning("Review committed; Qdrant status mirror failed", exc_info=True)
+    click.echo(f"Recorded {decision} decision for {document_id}.")
 
 
 @cli.command("load-policies-pdf")
 @click.argument(
     "pdf_file",
-    default="data/policies/dl-binding-corporate-rules-privacy.pdf",
     type=click.Path(exists=True, dir_okay=False),
 )
 @click.option(
@@ -266,76 +310,21 @@ def load_policies_pdf(
 
 @cli.command()
 def status() -> None:
-    """Show system status: Qdrant collections and unprocessed document count."""
-    settings = get_settings()
+    """Show authoritative PostgreSQL lifecycle counts and Qdrant collection health."""
     from legal_agent.db.client import client_from_settings
     from legal_agent.db.manifest import DocumentManifest
 
+    settings = get_settings()
+    manifest = DocumentManifest(settings.database_url)
+    click.echo(f"  Acquisition: {manifest.counts()}")
+    click.echo(f"  Workflow: {manifest.workflow_counts()}")
     client = client_from_settings(settings)
-
-    for name in [settings.qdrant_regulatory_collection, settings.qdrant_policies_collection]:
+    for name in (settings.qdrant_regulatory_collection, settings.qdrant_policies_collection):
         try:
             info = client.get_collection(name)
-            click.echo(f"  {name}: {info.points_count} points")
-        except Exception:
-            click.echo(f"  {name}: NOT FOUND")
-
-    from qdrant_client.models import FieldCondition, Filter, MatchValue
-
-    def _count_documents(workflow_filter: Filter) -> int:
-        document_ids: set[str] = set()
-        next_offset = None
-        while True:
-            points, next_offset = client.scroll(
-                collection_name=settings.qdrant_regulatory_collection,
-                scroll_filter=workflow_filter,
-                limit=256,
-                offset=next_offset,
-                with_payload=["document_id"],
-                with_vectors=False,
-            )
-            document_ids.update(
-                point.payload["document_id"]
-                for point in points
-                if point.payload and point.payload.get("document_id")
-            )
-            if next_offset is None:
-                return len(document_ids)
-
-    try:
-        unprocessed = _count_documents(
-            Filter(must=[FieldCondition(key="is_processed", match=MatchValue(value=False))])
-        )
-        click.echo(f"  Unprocessed regulations: {unprocessed}")
-        review_required = _count_documents(
-            Filter(
-                must=[
-                    FieldCondition(
-                        key="workflow_status",
-                        match=MatchValue(value="review_required"),
-                    )
-                ]
-            )
-        )
-        click.echo(f"  Regulations requiring review: {review_required}")
-        pending_human = _count_documents(
-            Filter(
-                must=[
-                    FieldCondition(
-                        key="workflow_status", match=MatchValue(value="pending_human_review")
-                    )
-                ]
-            )
-        )
-        click.echo(f"  Awaiting human decision: {pending_human}")
-    except Exception:
-        click.echo("  Could not count workflow states.")
-
-    manifest_counts = DocumentManifest(settings.manifest_file).counts()
-    if manifest_counts:
-        click.echo("  Acquisition manifest:")
-        for state, count in sorted(manifest_counts.items()):
-            click.echo(f"    {state}: {count}")
+            click.echo(f"  {name}: {info.points_count} search points")
+        except Exception:  # noqa: BLE001 - search health is advisory
+            click.echo(f"  {name}: unavailable")
 
 
 if __name__ == "__main__":
