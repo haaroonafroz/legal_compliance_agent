@@ -20,14 +20,14 @@ def get_legal_embedder(model_name: str, device: str = "cuda"):
     return model
 
 
-def embed_texts_legal(texts: list[str], settings: "Settings") -> list[list[float]]:
+def embed_texts_legal(texts: list[str], settings: Settings) -> list[list[float]]:
     """Embed a batch of texts using the legal embedding model."""
     model = get_legal_embedder(settings.legal_embedding_model, settings.legal_embedding_device)
     embeddings = model.encode(texts, show_progress_bar=False, normalize_embeddings=True)
     return embeddings.tolist()
 
 
-def embed_texts_openai(texts: list[str], settings: "Settings") -> list[list[float]]:
+def embed_texts_openai(texts: list[str], settings: Settings) -> list[list[float]]:
     """Embed texts using OpenAI (fallback)."""
     from openai import OpenAI
 
@@ -38,7 +38,7 @@ def embed_texts_openai(texts: list[str], settings: "Settings") -> list[list[floa
     return [d.embedding for d in resp.data]
 
 
-def embed_texts(texts: list[str], settings: "Settings") -> list[list[float]]:
+def embed_texts(texts: list[str], settings: Settings) -> list[list[float]]:
     """Route to legal or OpenAI embeddings based on config."""
     if settings.use_legal_embeddings:
         return embed_texts_legal(texts, settings)
@@ -55,7 +55,7 @@ def get_sparse_encoder(model_name: str):
 
 
 def sparse_encode_texts(
-    texts: list[str], settings: "Settings"
+    texts: list[str], settings: Settings
 ) -> list[tuple[list[int], list[float]]]:
     """Return sparse vectors as (indices, values) tuples."""
     encoder = get_sparse_encoder(settings.sparse_embedding_model)
@@ -65,7 +65,7 @@ def sparse_encode_texts(
 
 def compute_vectors(
     texts: list[str],
-    settings: "Settings",
+    settings: Settings,
     dense_name: str,
     sparse_name: str,
 ) -> list[dict]:

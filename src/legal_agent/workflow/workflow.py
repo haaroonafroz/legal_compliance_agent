@@ -16,7 +16,11 @@ from llama_index.core.workflow import (
 
 from legal_agent.config import Settings
 from legal_agent.db.client import client_from_settings
-from legal_agent.utils.assessments import parse_assessments, render_assessments
+from legal_agent.utils.assessments import (
+    ObligationAssessment,
+    parse_assessments,
+    render_assessments,
+)
 from legal_agent.utils.obligations import (
     LegalObligation,
     ObligationEvidence,
@@ -75,7 +79,7 @@ def _format_policy_evidence(policies: list[dict], *, max_chars: int = 12000) -> 
 
 
 def _policy_provenance(policies: list[dict]) -> list[dict]:
-    fields = ("policy_id", "document_id", "chunk_id", "header_path", "department")
+    fields = ("policy_id", "document_id", "document_hash", "chunk_id", "header_path", "department")
     return [{field: policy.get(field) for field in fields} for policy in policies]
 
 
@@ -139,14 +143,16 @@ class ComplianceWorkflow(Workflow):
     # ------------------------------------------------------------------
     @step
     async def horizon_scanner(self, ctx: Context, ev: StartEvent) -> NewLawEvent | StopEvent:
-        """Pull unprocessed regulatory chunks from Qdrant, validate sequence integrity, and rebuild full documents."""
+        """Rebuild the document already claimed in PostgreSQL."""
         logger.info("Horizon Scanner: fetching unprocessed regulations…")
         from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-        pending_filter = Filter(
-            must=[FieldCondition(key="is_processed", match=MatchValue(value=False))],
-            must_not=[FieldCondition(key="is_current", match=MatchValue(value=False))],
-        )
+        document_id = getattr(ev, "document_id", None)
+        if not document_id:
+            raise ValueError("A PostgreSQL document claim is required")
+        pending_filter = Filter(must=[
+            FieldCondition(key="document_id", match=MatchValue(value=document_id))
+        ])
         points = []
         next_offset = None
         while True:
@@ -163,8 +169,7 @@ class ComplianceWorkflow(Workflow):
                 break
 
         if not points:
-            logger.info("No unprocessed regulations found.")
-            return StopEvent(result={"reports": []})
+            raise ValueError(f"Claimed document {document_id} is absent from Qdrant")
 
         grouped: dict[str, list] = {}
         for pt in points:
@@ -176,8 +181,7 @@ class ComplianceWorkflow(Workflow):
             grouped.setdefault(document_id, []).append(pt)
 
         if not grouped:
-            logger.info("No valid unprocessed regulatory documents found.")
-            return StopEvent(result={"reports": []})
+            raise ValueError(f"Claimed document {document_id} has no valid chunks")
 
         for document_id, chunks in grouped.items():
             chunks.sort(key=lambda p: p.payload.get("chunk_index", 0))
@@ -196,11 +200,12 @@ class ComplianceWorkflow(Workflow):
                     expected_chunk_count,
                     indices,
                 )
-                continue
+                raise ValueError(f"Claimed document {document_id} has incomplete chunks")
 
             if any(c.payload.get("document_hash") != document_hash for c in chunks):
-                logger.warning("Skipping inconsistent document_hash set for %s", document_id)
-                continue
+                raise ValueError(f"Claimed document {document_id} has inconsistent hashes")
+            if getattr(ev, "document_hash", None) and ev.document_hash != document_hash:
+                raise ValueError("Claimed document hash does not match Qdrant")
 
             combined_text = "\n\n".join(c.payload["text"] for c in chunks)
 
@@ -229,7 +234,7 @@ class ComplianceWorkflow(Workflow):
                 is_current=first.get("is_current", True),
             )
 
-        return StopEvent(result={"reports": []})
+        raise ValueError("Claimed document could not be reconstructed")
 
     # ------------------------------------------------------------------
     # Step 2 – Obligation extraction
@@ -240,6 +245,21 @@ class ComplianceWorkflow(Workflow):
     ) -> ObligationsExtractedEvent | StopEvent:
         """Extract across every source chunk; incomplete extraction requires review."""
         logger.info("Obligation Extractor: decomposing '%s'…", ev.source_url)
+        # Reject cheap noise before paying for extraction and vector search.
+        try:
+            response = await self.llm_relevance_check.achat(
+                messages=_chat_messages(
+                    RELEVANCE_CHECK_SYSTEM,
+                    RELEVANCE_CHECK_USER.format(regulation_text=ev.regulation_text[:8000]),
+                )
+            )
+            decision = response.message.content.strip().upper()
+        except Exception as exc:  # noqa: BLE001 - failed model calls require review
+            return StopEvent(result=_stopped_result(ev, "review_required", f"relevance_error: {exc}"))
+        if decision == "IRRELEVANT":
+            return StopEvent(result=_stopped_result(ev, "irrelevant", "irrelevant"))
+        if decision != "RELEVANT":
+            return StopEvent(result=_stopped_result(ev, "review_required", "invalid_relevance_decision"))
         obligations: list[LegalObligation] = []
         seen_quotes: set[str] = set()
         chunks = ev.regulation_chunks or [ev.regulation_text]
@@ -267,6 +287,8 @@ class ComplianceWorkflow(Workflow):
                         )
             if not obligations:
                 raise ValueError("No obligations were extracted from the document")
+            if len(obligations) >= self.settings.obligation_extraction_max:
+                raise ValueError("Document obligation count reached the configured limit")
         except ValueError as exc:
             logger.warning("Obligation extraction needs review: %s", exc)
             return StopEvent(result=_stopped_result(ev, "review_required", str(exc)))
@@ -504,29 +526,31 @@ class ComplianceWorkflow(Workflow):
     async def relevance_check(
         self, ctx: Context, ev: RetrievedContextEvent
     ) -> RelevantContextEvent | StopEvent:
-        """Determine if the regulation is relevant or noise."""
+        """Gate uncertain retrieval after the earlier relevance decision."""
 
         logger.info(
             "Relevance check: checking '%s'…",
             ev.regulation.source_url,
         )
-        prompt = RELEVANCE_CHECK_USER.format(
-            regulation_text=ev.regulation.regulation_text,
-        )
-        response = await self.llm_relevance_check.achat(
-            messages=_chat_messages(RELEVANCE_CHECK_SYSTEM, prompt)
-        )
-        decision = response.message.content.strip().upper()
-
-        if decision not in {"RELEVANT", "IRRELEVANT"}:
-            raise ValueError(f"Unexpected relevance decision: {decision!r}")
-
-        if decision == "IRRELEVANT":
-            logger.info("Document marked as IRRELEVANT. Stopping workflow and starting again.")
-            return StopEvent(result=_stopped_result(ev.regulation, "irrelevant", "irrelevant"))
-
-        logger.info("Document is RELEVANT. Continuing workflow.")
-        if any(not bundle.get("sufficient", False) for bundle in ev.obligation_evidence):
+        if any(not bundle.get("matched_policies") for bundle in ev.obligation_evidence):
+            try:
+                policy_count = self.qdrant.count(
+                    collection_name=self.settings.qdrant_policies_collection, exact=True
+                ).count
+            except Exception as exc:  # noqa: BLE001 - unavailable index requires review
+                return StopEvent(result=_stopped_result(
+                    ev.regulation, "review_required", f"policy_index_unavailable: {exc}",
+                    obligation_evidence=ev.obligation_evidence,
+                ))
+            if policy_count == 0:
+                return StopEvent(result=_stopped_result(
+                    ev.regulation, "review_required", "policy_corpus_empty",
+                    obligation_evidence=ev.obligation_evidence,
+                ))
+        if any(
+            not bundle.get("sufficient", False) and bundle.get("matched_policies")
+            for bundle in ev.obligation_evidence
+        ):
             logger.warning("Evidence gate failed for '%s'.", ev.regulation.source_url)
             return StopEvent(
                 result=_stopped_result(
@@ -556,16 +580,25 @@ class ComplianceWorkflow(Workflow):
         assessments = []
         try:
             for bundle in ev.obligation_evidence:
+                if not bundle["matched_policies"]:
+                    assessments.append(ObligationAssessment(
+                        obligation_id=bundle["obligation_id"],
+                        regulation_quote=bundle["obligation"]["quote"],
+                        outcome="gap",
+                        explanation="No matching internal policy was retrieved; human review must verify corpus completeness.",
+                        severity="high",
+                    ))
+                    continue
                 prompt = ANALYST_USER.format(
                     jurisdiction=ev.regulation.jurisdiction,
                     source_url=ev.regulation.source_url,
                     effective_date=ev.regulation.effective_date,
                     regulation_text=bundle["obligation"]["quote"],
                     policies_text=_format_policy_evidence(
-                        bundle["matched_policies"], max_chars=40000
+                        bundle["matched_policies"], max_chars=12000
                     ),
                     obligation_evidence=_format_obligation_evidence(
-                        [bundle], max_chars=40000, per_obligation_chars=40000
+                        [bundle], max_chars=12000, per_obligation_chars=12000
                     ),
                 )
                 response = await self.llm_analyst.achat(
@@ -693,9 +726,9 @@ class ComplianceWorkflow(Workflow):
             regulation_text="\n".join(
                 bundle["obligation"]["quote"] for bundle in obligation_evidence
             ),
-            policies_text=_format_policy_evidence(matched_policies, max_chars=1000000),
+            policies_text=_format_policy_evidence(matched_policies, max_chars=16000),
             obligation_evidence=_format_obligation_evidence(
-                obligation_evidence, max_chars=1000000, per_obligation_chars=1000000
+                obligation_evidence, max_chars=16000, per_obligation_chars=4000
             ),
             gap_analysis=ev.gap_analysis,
             proposed_updates=ev.proposed_updates,

@@ -11,11 +11,11 @@ from legal_agent.workflow.events import (
 from legal_agent.workflow.workflow import ComplianceWorkflow
 
 __all__ = [
+    "AnalysisCompleteEvent",
+    "AuditResultEvent",
     "ComplianceWorkflow",
+    "DraftCompleteEvent",
+    "FinalReportEvent",
     "NewLawEvent",
     "RetrievedContextEvent",
-    "AnalysisCompleteEvent",
-    "DraftCompleteEvent",
-    "AuditResultEvent",
-    "FinalReportEvent",
 ]

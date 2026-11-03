@@ -8,7 +8,7 @@ from llama_index.core.workflow import StopEvent
 
 from legal_agent.config import Settings
 from legal_agent.utils import state
-from legal_agent.workflow.events import NewLawEvent, RelevantContextEvent
+from legal_agent.workflow.events import NewLawEvent, RelevantContextEvent, RetrievedContextEvent
 from legal_agent.workflow.workflow import ComplianceWorkflow
 
 
@@ -45,7 +45,10 @@ def _law():
 
 
 def _workflow(monkeypatch, replies):
-    monkeypatch.setattr("legal_agent.workflow.workflow.get_llm_for_step", lambda *_: FakeLLM(replies))
+    monkeypatch.setattr(
+        "legal_agent.workflow.workflow.get_llm_for_step",
+        lambda _settings, step: FakeLLM(["RELEVANT"] if step == "relevance_check" else replies),
+    )
     monkeypatch.setattr("legal_agent.workflow.workflow.client_from_settings", lambda *_: object())
     return ComplianceWorkflow(Settings(_env_file=None), timeout=10)
 
@@ -90,58 +93,96 @@ async def test_incomplete_analysis_stops_for_review(monkeypatch):
     assert result.result["reason"].startswith("invalid_analysis")
 
 
-def test_result_is_not_marked_processed_if_report_write_fails(monkeypatch):
+def test_local_export_failure_does_not_lose_durable_report(monkeypatch):
     calls = []
 
-    def fail_save(result):
-        calls.append("save")
+    class FakeManifest:
+        def __init__(self, _url):
+            pass
+
+        def complete_workflow(self, revision_id, document_hash, token, report):
+            calls.append(("commit", revision_id, document_hash, token, report["status"]))
+
+    def fail_save(_result):
         raise OSError("disk full")
 
+    monkeypatch.setattr(state, "DocumentManifest", FakeManifest)
     monkeypatch.setattr(state, "save_report", fail_save)
-    monkeypatch.setattr(state, "mark_document_state", lambda *_args, **_kwargs: calls.append("mark"))
-    with pytest.raises(OSError, match="disk full"):
-        state.persist_workflow_result(
-            Settings(_env_file=None), {"document_id": "doc-1", "status": "review_required"}
-        )
-    assert calls == ["save"]
-
-
-def test_result_is_marked_only_after_report_is_saved(monkeypatch, tmp_path):
-    calls = []
-    report = tmp_path / "doc-1.md"
-
-    def save(result):
-        calls.append("save")
-        return report
-
-    def mark(_settings, document_id, status, **kwargs):
-        calls.append("mark")
-        assert (document_id, status) == ("doc-1", "pending_human_review")
-        assert kwargs["expected_status"] == "pending"
-
-    monkeypatch.setattr(state, "save_report", save)
-    monkeypatch.setattr(state, "mark_document_state", mark)
+    monkeypatch.setattr(state, "mirror_document_state", lambda *_: None)
+    result = {"document_id": "doc-1", "document_hash": "hash-1", "status": "review_required"}
     path = state.persist_workflow_result(
-        Settings(_env_file=None),
-        {"document_id": "doc-1", "document_hash": "hash-1", "status": "pending_human_review"},
+        Settings(_env_file=None, database_url="postgresql://test"),
+        result,
+        {"revision_id": "doc-1", "document_hash": "hash-1", "claim_token": "token"},
     )
-    assert path == report
-    assert calls == ["save", "mark"]
+    assert path.startswith("postgresql:")
+    assert calls == [("commit", "doc-1", "hash-1", "token", "review_required")]
 
 
-def test_review_rejects_superseded_document():
-    client = SimpleNamespace(
-        scroll=lambda **_kwargs: (
-            [SimpleNamespace(payload={"workflow_status": "pending_human_review", "is_current": False})],
-            None,
-        ),
-        set_payload=lambda **_kwargs: pytest.fail("Superseded document was updated"),
-    )
-    with pytest.raises(ValueError, match="current document state"):
-        state.mark_document_state(
-            Settings(_env_file=None),
-            "doc-1",
-            "approved",
-            client=client,
-            expected_status="pending_human_review",
+def test_failed_db_commit_prevents_local_export(monkeypatch):
+    calls = []
+
+    class FakeManifest:
+        def __init__(self, _url):
+            pass
+
+        def complete_workflow(self, *_):
+            raise ValueError("stale claim")
+
+    monkeypatch.setattr(state, "DocumentManifest", FakeManifest)
+    monkeypatch.setattr(state, "save_report", lambda *_: calls.append("export"))
+    with pytest.raises(ValueError, match="stale claim"):
+        state.persist_workflow_result(
+            Settings(_env_file=None, database_url="postgresql://test"),
+            {"document_id": "doc-1", "document_hash": "hash-1", "status": "review_required"},
+            {"revision_id": "doc-1", "document_hash": "hash-1", "claim_token": "token"},
         )
+    assert calls == []
+
+
+@pytest.mark.asyncio
+async def test_irrelevant_document_stops_before_extraction(monkeypatch):
+    monkeypatch.setattr(
+        "legal_agent.workflow.workflow.get_llm_for_step",
+        lambda _settings, step: FakeLLM(["IRRELEVANT"] if step == "relevance_check" else []),
+    )
+    monkeypatch.setattr("legal_agent.workflow.workflow.client_from_settings", lambda *_: object())
+    workflow = ComplianceWorkflow(Settings(_env_file=None), timeout=10)
+    result = await workflow.obligation_extractor(SimpleNamespace(store=FakeStore()), _law())
+    assert result.result["status"] == "irrelevant"
+
+
+@pytest.mark.asyncio
+async def test_missing_policy_is_a_gap_when_corpus_exists(monkeypatch):
+    workflow = _workflow(monkeypatch, [])
+    workflow.qdrant = SimpleNamespace(count=lambda **_: SimpleNamespace(count=1))
+    bundle = {
+        "obligation_id": "obligation-1",
+        "obligation": {"quote": "First duty.", "action": "First"},
+        "matched_policies": [],
+        "sufficient": False,
+    }
+    event = RetrievedContextEvent(
+        regulation=_law(), matched_policies=[], retrieval_scores=[],
+        obligation_evidence=[bundle],
+    )
+    relevant = await workflow.relevance_check(SimpleNamespace(store=FakeStore()), event)
+    assert not isinstance(relevant, StopEvent)
+    result = await workflow.analyst(SimpleNamespace(store=FakeStore()), relevant)
+    assert "No matching internal policy" in result.gap_analysis
+
+
+@pytest.mark.asyncio
+async def test_empty_policy_corpus_requires_review(monkeypatch):
+    workflow = _workflow(monkeypatch, [])
+    workflow.qdrant = SimpleNamespace(count=lambda **_: SimpleNamespace(count=0))
+    event = RetrievedContextEvent(
+        regulation=_law(), matched_policies=[], retrieval_scores=[],
+        obligation_evidence=[{
+            "obligation_id": "obligation-1",
+            "obligation": {"quote": "First duty.", "action": "First"},
+            "matched_policies": [], "sufficient": False,
+        }],
+    )
+    result = await workflow.relevance_check(SimpleNamespace(store=FakeStore()), event)
+    assert result.result["reason"] == "policy_corpus_empty"

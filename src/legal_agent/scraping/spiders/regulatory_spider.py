@@ -44,7 +44,7 @@ import random
 from collections.abc import AsyncIterator, Iterator
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 from urllib.parse import urlparse
 
 import scrapy
@@ -136,19 +136,19 @@ class _JobState:
     """Tracks quotas and config for a single targets.json start_url entry."""
 
     __slots__ = (
-        "jurisdiction",
+        "allow_patterns",
         "allowed_domains",
+        "deny_patterns",
         "follow_links",
         "follow_pdf",
+        "html_requests_pending",
+        "jurisdiction",
         "max_depth",
         "max_pages",
         "max_pdfs",
         "pages_seen",
-        "pdfs_seen",
-        "html_requests_pending",
         "pdf_requests_pending",
-        "allow_patterns",
-        "deny_patterns",
+        "pdfs_seen",
     )
 
     def __init__(
@@ -161,8 +161,8 @@ class _JobState:
         max_depth: int,
         max_pages: int,
         max_pdfs: int,
-        allow_patterns: list[str] = None,
-        deny_patterns: list[str] = None,
+        allow_patterns: list[str] | None = None,
+        deny_patterns: list[str] | None = None,
     ) -> None:
         self.jurisdiction = jurisdiction
         # Strip leading wildcard so "*.europa.eu" → "europa.eu"
@@ -248,7 +248,7 @@ class RegulatorySpider(scrapy.Spider):
 
     name = "regulatory"
 
-    custom_settings: dict[str, Any] = {
+    custom_settings: ClassVar[dict[str, Any]] = {
         # --- connection robustness ---
         "DOWNLOAD_HANDLERS": {
             "https": "scrapy.core.downloader.handlers.http11.HTTP11DownloadHandler",
@@ -494,10 +494,7 @@ class RegulatorySpider(scrapy.Spider):
                 response.url,
                 encoding or "unknown",
             )
-            try:
-                return response.body.decode("utf-8", errors="replace")
-            except Exception:
-                return None
+            return response.body.decode("utf-8", errors="replace")
 
     def _handle_html(
         self,
@@ -558,7 +555,7 @@ class RegulatorySpider(scrapy.Spider):
                 if meta and meta.title:
                     title = meta.title
             except Exception:
-                pass
+                logger.debug("Could not extract title metadata from %s", response.url, exc_info=True)
         if not title:
             title = response.url.split("/")[-1] or response.url
 

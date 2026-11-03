@@ -71,7 +71,8 @@ class Settings(BaseSettings):
     content_validation_llm_model: str = "gpt-4o-mini"
     content_validation_confidence_threshold: float = 0.8
     quarantine_file: str = "data/quarantine/rejected_documents.jsonl"
-    manifest_file: str = "data/state/document_manifest.sqlite3"
+    database_url: str | None = None
+    workflow_lease_seconds: int = 1800
 
     # Chunking
     chunk_max_tokens: int = 512

@@ -87,7 +87,7 @@ class ContentValidationPipeline:
 
     def open_spider(self, spider: Any) -> None:
         self._settings = get_settings()
-        self._manifest = DocumentManifest(self._settings.manifest_file)
+        self._manifest = DocumentManifest(self._settings.database_url)
 
     def process_item(self, item: RegulatoryDocumentItem, spider: Any) -> RegulatoryDocumentItem:
         if not isinstance(item, RegulatoryDocumentItem):
@@ -120,7 +120,7 @@ class ContentValidationPipeline:
         item_source_id = item.get("source_id", "generic")
         item_source_key = item.get("source_key") or source_key(item_source_id, canonical_url)
         item_revision_id = revision_id(item_source_key, normalized_text)
-        manifest = self._manifest or DocumentManifest(settings.manifest_file)
+        manifest = self._manifest or DocumentManifest(settings.database_url)
         manifest_result = manifest.prepare(
             source_id=item_source_id,
             source_key=item_source_key,
@@ -422,7 +422,7 @@ def _parse_json_object(content: str | None) -> dict:
         cleaned = re.sub(r"^```(?:json)?\s*|\s*```$", "", cleaned, flags=re.IGNORECASE)
     parsed = json.loads(cleaned)
     if not isinstance(parsed, dict):
-        raise ValueError("Metadata model response must be a JSON object.")
+        raise ValueError("Metadata model response must be a JSON object.")  # noqa: TRY004
     return parsed
 
 
@@ -614,7 +614,7 @@ class QdrantPipeline:
         self._settings = get_settings()
         self._client = client_from_settings(self._settings)
         self._collection = self._settings.qdrant_regulatory_collection
-        self._manifest = DocumentManifest(self._settings.manifest_file)
+        self._manifest = DocumentManifest(self._settings.database_url)
 
     def process_item(self, item: Any, spider: Any) -> Any:
         """Accept a single ChunkedRegulationItem or a list of them."""
@@ -628,7 +628,7 @@ class QdrantPipeline:
         if not incoming:
             return item
 
-        manifest = self._manifest or DocumentManifest(get_settings().manifest_file)
+        manifest = self._manifest or DocumentManifest(get_settings().database_url)
         for chunk in incoming:
             manifest.set_expected_chunks(
                 chunk.get("revision_id", chunk["document_id"]),
@@ -673,42 +673,47 @@ class QdrantPipeline:
                 for chunk, named_vectors in zip(chunks, named_vectors_list)
             ]
 
-            self._client.upsert(collection_name=self._collection, points=points)
+            self._client.upsert(collection_name=self._collection, points=points, wait=True)
         except Exception as exc:
-            manifest = self._manifest or DocumentManifest(self._settings.manifest_file)
+            manifest = self._manifest or DocumentManifest(self._settings.database_url)
             for revision in revisions:
                 manifest.mark_failed(revision, str(exc))
             raise
 
         logger.info("Upserted batch of %d regulatory chunks.", len(points))
 
-        manifest = self._manifest or DocumentManifest(self._settings.manifest_file)
+        manifest = self._manifest or DocumentManifest(self._settings.database_url)
         for revision in revisions:
             revision_chunks = [
                 chunk for chunk in chunks if chunk.get("revision_id", chunk["document_id"]) == revision
             ]
-            if not manifest.record_chunks(revision, len(revision_chunks)):
+            if not manifest.record_chunks(
+                revision, [chunk["chunk_index"] for chunk in revision_chunks]
+            ):
                 continue
             superseded = manifest.mark_stored(revision)
             if superseded:
                 from qdrant_client.models import FieldCondition, Filter, MatchValue
 
-                self._client.set_payload(
-                    collection_name=self._collection,
-                    payload={
-                        "is_current": False,
-                        "is_processed": True,
-                        "workflow_status": "superseded",
-                    },
-                    points=Filter(
-                        must=[
-                            FieldCondition(
-                                key="revision_id",
-                                match=MatchValue(value=superseded),
-                            )
-                        ]
-                    ),
-                )
+                try:
+                    self._client.set_payload(
+                        collection_name=self._collection,
+                        payload={
+                            "is_current": False,
+                            "is_processed": True,
+                            "workflow_status": "superseded",
+                        },
+                        points=Filter(
+                            must=[
+                                FieldCondition(
+                                    key="revision_id",
+                                    match=MatchValue(value=superseded),
+                                )
+                            ]
+                        ),
+                    )
+                except Exception:
+                    logger.warning("Qdrant supersession mirror failed; PostgreSQL is current", exc_info=True)
 
     @staticmethod
     def _build_point(chunk: ChunkedRegulationItem, named_vectors: Any) -> PointStruct:

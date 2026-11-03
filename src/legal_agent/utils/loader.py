@@ -228,7 +228,7 @@ def _build_point(
     """Construct a PointStruct with the minimal internal_policies payload."""
     chunk_index: int = chunk["chunk_index"]
     point_id = int(
-        hashlib.sha256(f"{document_hash}::{chunk_index}".encode()).hexdigest()[:32], 16
+        hashlib.sha256(f"{chunk['document_id']}::{chunk_index}".encode()).hexdigest()[:32], 16
     ) % (2**63)
 
     return PointStruct(
