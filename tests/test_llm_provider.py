@@ -51,3 +51,20 @@ def test_local_provider_forwards_auditor_reasoning(monkeypatch):
             "reasoning_effort": "xhigh",
         }
     }
+
+
+def test_gpt_6_luna_uses_responses_without_temperature():
+    from legal_agent.config import Settings
+
+    settings = Settings(
+        _env_file=None,
+        use_local_llm=False,
+        openai_llm_model="gpt-6-luna",
+        openai_api_key="test-key",
+    )
+    provider = get_llm_for_step(settings, "analyst")
+    assert provider.model == "gpt-6-luna"
+    assert provider.metadata.context_window == 1_050_000
+    request = provider._get_model_kwargs()
+    assert request["reasoning"] == {"effort": "medium"}
+    assert "temperature" not in request

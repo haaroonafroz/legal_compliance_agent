@@ -54,3 +54,24 @@ def test_obligation_query_contains_structured_fields():
     assert "controller" in query
     assert "72 hours" in query
     assert "breach_notification" in query
+
+
+def test_strict_parser_accepts_null_optional_fields_without_changing_quote():
+    import json
+
+    source = "The controller must document personal data breaches."
+    content = json.dumps({"obligations": [{
+        "quote": source,
+        "action": "document personal data breaches",
+        "deadline": None,
+        "conditions": None,
+        "topic_tags": None,
+        "confidence": None,
+    }]})
+    obligations = parse_obligations(content, source, strict=True)
+    assert len(obligations) == 1
+    assert obligations[0].quote == source
+    assert obligations[0].deadline == ""
+    assert obligations[0].conditions == ""
+    assert obligations[0].topic_tags == []
+    assert obligations[0].confidence == 0.0
