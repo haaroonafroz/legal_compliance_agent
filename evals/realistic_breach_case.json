@@ -1,0 +1,21 @@
+{
+  "id": "gdpr-article-33-breach-notification",
+  "test_only": true,
+  "disclaimer": "Evaluation material only. The regulatory text is an original paraphrase of selected parts of GDPR Article 33, not an official quotation or legal advice. The company and internal policy are entirely fictional.",
+  "official_source_url": "https://eur-lex.europa.eu/eli/reg/2016/679/oj/eng",
+  "source_title": "GDPR Article 33: notification of a personal data breach to a supervisory authority (test paraphrase)",
+  "source_id": "manual-test-paraphrase-gdpr-article-33",
+  "legal_identifier": "Regulation (EU) 2016/679, Article 33",
+  "jurisdiction": "European Union",
+  "regulation_text": "# Regulation (EU) 2016/679 — Article 33: supervisory authority notification\n\nA controller that becomes aware of a personal data breach must inform the competent supervisory authority without undue delay. Where feasible, it must do so within 72 hours after becoming aware of the breach. The exception is a breach unlikely to create a risk to the rights and freedoms of natural persons. If the notification is sent after 72 hours, the controller must explain the delay. The reporting decision therefore depends on whether risk is unlikely, rather than on whether the potential harm is classified as high.\n\nThe notification must explain the nature of the breach, including approximate numbers and categories of affected people and personal data records where possible. It must identify a data protection officer or other contact point, describe likely consequences, and describe measures taken or proposed to address and mitigate the breach. Information may be provided in phases when it cannot all be supplied at once.\n\nThe controller must document personal data breaches, including their facts, effects, and remedial actions, so that the supervisory authority can check compliance.",
+  "policy_id": "aster-services-breach-response-v1",
+  "policy_title": "Aster Services — Personal Data Breach Response Policy v1",
+  "policy_department": "Privacy and Security",
+  "policy_text": "# Aster Services — Personal Data Breach Response Policy v1\n\nAster Services is a fictional company used only for this evaluation. When an employee discovers a suspected personal data breach, the employee must notify the Security Desk immediately. The Security Desk records the time of discovery, affected systems, categories of personal data, approximate numbers of affected people and records, likely consequences, and containment actions. The Privacy Lead reviews this record and decides whether outside notification is needed.\n\nThe Privacy Lead notifies the relevant supervisory authority only when the event is judged likely to create a high risk of serious harm to affected people. For events selected for notification, the Privacy Lead aims to send the report within five calendar days after the company becomes aware of the breach. The policy does not require an explanation if this five-day target is missed. The report names the Privacy Lead as contact and describes the breach, its likely consequences, and corrective steps. The team documents every personal data breach and keeps the incident record available for audit.",
+  "expected_observations": [
+    "The source should pass the actual-law relevance gate, because it paraphrases a real GDPR obligation.",
+    "The internal policy's five-day target is weaker than Article 33's 72-hour requirement where feasible.",
+    "The internal policy's high-risk-only reporting threshold is narrower than Article 33's risk-based exception.",
+    "The policy covers breach documentation and several notification details, so the result should not imply that every obligation is absent."
+  ]
+}

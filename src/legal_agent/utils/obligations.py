@@ -96,6 +96,14 @@ def parse_obligations(
             raw_item = dict(raw_item)
             raw_item.setdefault("obligation_id", f"obligation-{index}")
             raw_item.setdefault("action", "Comply with the stated requirement")
+            for optional_text in ("actor", "object", "conditions", "deadline"):
+                if raw_item.get(optional_text) is None:
+                    raw_item[optional_text] = ""
+            for optional_list in ("responsible_departments", "topic_tags"):
+                if raw_item.get(optional_list) is None:
+                    raw_item[optional_list] = []
+            if raw_item.get("confidence") is None:
+                raw_item["confidence"] = 0.0
             obligation = LegalObligation.model_validate(raw_item)
             if obligation.quote and obligation.quote in source_text:
                 obligations.append(obligation)

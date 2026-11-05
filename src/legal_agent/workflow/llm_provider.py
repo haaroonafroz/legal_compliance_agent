@@ -84,4 +84,20 @@ def get_llm_for_step(settings: Settings, step_name: str) -> LLM:
     else:
         model = settings.openai_llm_model
 
+    if model == "gpt-6-luna":
+        from llama_index.llms.openai_like import OpenAILikeResponses
+
+        # This installed LlamaIndex version has a static Chat Completions model
+        # list that predates GPT-6. Its Responses adapter accepts the model and
+        # suppresses unsupported temperature when reasoning_options is set.
+        return OpenAILikeResponses(
+            model=model,
+            api_key=settings.openai_api_key,
+            context_window=1_050_000,
+            is_function_calling_model=False,
+            reasoning_options={"effort": "medium"},
+            additional_kwargs={"reasoning": {"effort": "medium"}},
+            store=False,
+        )
+
     return LlamaOpenAI(model=model, api_key=settings.openai_api_key)
